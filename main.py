@@ -1,6 +1,4 @@
-def main():
-    print("Hello from gestao-cpm-agno!")
-
+from app.agent_os import ag_os
 
 if __name__ == "__main__":
-    main()
+    ag_os.serve(app="app.agent_os:app", host="localhost", port=7777, reload=True)

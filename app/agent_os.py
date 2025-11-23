@@ -1,5 +1,5 @@
 from agno.os import AgentOS
-from app.agents.milhas import milhas_agent
+from app.agents.agente_milhas import milhas_agent
 from fastapi import FastAPI
 
 # Definição do Sistema Operacional de Agentes
