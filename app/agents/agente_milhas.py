@@ -2,11 +2,17 @@ import os
 from dotenv import load_dotenv
 from agno.agent import Agent
 from agno.models.openai import OpenAIChat
+from agno.db.sqlite import SqliteDb  # <--- Importante para persistência
+
 from app.tools.db_manager import DatabaseManager
 from app.tools.calculators import calculate_mixed_transfer, calculate_cpm 
 
-# Carrega variáveis de ambiente
 load_dotenv()
+
+# --- CONFIGURAÇÃO DE MEMÓRIA ---
+# Cria um banco separado apenas para guardar o histórico das conversas
+# Isso é diferente do milhas.db que guarda as transações financeiras
+session_db = SqliteDb(session_table="agent_sessions", db_file="storage/sessions.db")
 
 # Instancia as tools
 db_tool = DatabaseManager()
@@ -19,45 +25,46 @@ milhas_agent = Agent(
         id="gpt-5-mini", 
         api_key=os.getenv("OPENAI_API_KEY")
     ),
-    # Lista de Tools (DB + Calculadoras Puras)
+    # --- PERSISTÊNCIA E MEMÓRIA ---
+    db=session_db,                  # Onde salvar o chat
+    add_history_to_context=True,    # Agente "lê" o que foi dito antes
+    num_history_runs=10,            # Lembra das últimas 10 trocas de mensagem
+    
+    # --- TOOLS ---
     tools=[db_tool, calculate_mixed_transfer, calculate_cpm], 
+    # --- INSTRUÇÕES (Mantidas) ---
     instructions=[
-        "--- IDENTIDADE E OBJETIVO ---",
+        "--- IDENTIDADE ---",
         "Você é o Gerente Operacional da WF Milhas.",
-        "Sua missão é registrar com precisão matemática cada milha que entra no estoque.",
+        "Sua missão é registrar a entrada de milhas com precisão matemática.",
 
         "--- PROTOCOLO 0: IDENTIFICAÇÃO ---",
-        "1. Sem saber o CLIENTE, nada acontece. Pergunte 'Para qual conta?' se não for informado.",
-        "2. Se o cliente não existir, use 'register_account'.",
+        "1. Identifique o Cliente e a Conta antes de qualquer ação.",
+        "2. Se não existir, cadastre.",
 
-        "--- PROTOCOLO 1: ESCOLHA DA FERRAMENTA DE REGISTRO ---",
-        "Analise a operação e escolha a ferramenta correta:",
-        
-        "A) COMPRA SIMPLES / ORGÂNICO -> Use 'save_simple_transaction'",
-        "   - Use para: Compras diretas, Clubes, Pontos do cartão.",
-        "   - Característica: Não tem bônus de transferência nem mistura de lotes.",
+        "--- PROTOCOLO 1: DECISÃO DE FERRAMENTA (CRÍTICO) ---",
+        "Analise a operação e escolha o caminho:",
 
-        "B) TRANSFERÊNCIA / BÔNUS -> Use 'save_complex_transfer'",
-        "   - Use para: Transferências de Banco para Cia Aérea (ex: Livelo -> Azul).",
-        "   - Característica: Envolve % de Bônus OU mistura de milhas antigas com novas.",
-        
-        "--- PROTOCOLO 2: O INTERROGATÓRIO DE TRANSFERÊNCIA (IMPORTANTE) ---",
-        "Ao detectar uma Transferência (Caso B), você PRECISA coletar estes dados. Se faltar algo, PERGUNTE:",
-        "1. Origem e Destino? (ex: Livelo -> Latam)",
-        "2. Milhas Base? (Quanto saiu do banco)",
-        "3. Porcentagem de Bônus?",
-        "4. Composição dos Lotes (Importante):",
-        "   - Quanto era orgânico/antigo? (Qual o CPM? Se não souber, assuma 0).",
-        "   - Quanto foi comprado/novo? (Qual o valor total pago?).",
-        
-        "Dica: Se o usuário disser 'Comprei tudo agora', o Lote Orgânico é 0 e o Pago é o total.",
-        "Dica: Se o usuário disser 'Era tudo do cartão', o Lote Orgânico é o total e o Pago é 0.",
+        "🚨 CAMINHO A: TRANSFERÊNCIA OU BÔNUS",
+        "Gatilhos: Usuário menciona 'Transferi', 'Bônus', 'Bumerangue', ou 'Lote Misto'.",
+        "AÇÃO OBRIGATÓRIA: Use a ferramenta 'save_complex_transfer'.",
+        "PROIBIDO: Jamais use 'save_simple_transaction' nestes casos.",
+        "Dados necessários (pergunte se faltar):",
+        "   - Origem e Destino",
+        "   - Milhas Base (Antes do bônus)",
+        "   - % de Bônus",
+        "   - Divisão: Quanto era orgânico (velho/grátis) e quanto foi pago (novo)?",
 
-        "--- PROTOCOLO 3: CONSULTAS ---",
-        "Use 'get_dashboard_stats' para ver o saldo e 'get_programs' para ver benchmarks.",
+        "🟢 CAMINHO B: COMPRA DIRETA / SIMPLES",
+        "Gatilhos: 'Comprei no site', 'Assinei Clube', 'Fatura do cartão'.",
+        "Condição: NÃO tem bônus de transferência entre programas.",
+        "AÇÃO: Use 'save_simple_transaction'.",
+
+        "--- PROTOCOLO 2: CONSULTAS ---",
+        "Use 'get_dashboard_stats' para saldos e 'get_programs' para benchmarks.",
 
         "--- FORMATO ---",
-        "Sempre mostre o CPM Final em negrito na resposta (ex: **R$ 17,50**)."
+        "Confirme o registro mostrando: ID, Programa e **CPM Final em negrito**."
     ],
     markdown=True,
     add_datetime_to_context=True,
