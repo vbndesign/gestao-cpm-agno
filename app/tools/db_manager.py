@@ -16,6 +16,9 @@ class DatabaseManager(Toolkit):
         self.register(self.save_simple_transaction) # Agora atualizada
         self.register(self.get_dashboard_stats)
 
+        # Ferramentas para FASE 2 (Desativadas no MVP)
+        # self.register(self.save_issuance)
+
     def _get_conn(self):
         """Conexão com suporte a Foreign Keys"""
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)

@@ -1,12 +1,13 @@
 from agno.os import AgentOS
-from app.agents.agente_milhas import milhas_agent
+from agno.team import Team
+from app.agents.agente_milhas import milhas_team
 from fastapi import FastAPI
 
 # Definição do Sistema Operacional de Agentes
 ag_os = AgentOS(
     id="wf-milhas-os",
     description="Sistema de Gestão de Milhas WF",
-    agents=[milhas_agent]
+    teams=[milhas_team]
 )
 
 # Exporta o app FastAPI para o Render/Uvicorn
