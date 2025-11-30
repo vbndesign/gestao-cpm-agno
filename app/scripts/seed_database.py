@@ -5,10 +5,42 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 DB_PATH = Path("storage/milhas.db")
+SCHEMA_PATH = Path("app/data/schema.sql")
+
+def init_schema(conn):
+    if not SCHEMA_PATH.exists():
+        raise FileNotFoundError(f"Schema não encontrado em {SCHEMA_PATH}")
+    
+    with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
+        schema_sql = f.read()
+        conn.executescript(schema_sql)
+    print("✅ Schema criado/verificado com sucesso.")
+
+def seed_programs(conn):
+    programs = [
+        ("Livelo", "BANCO"),
+        ("Esfera", "BANCO"),
+        ("Smiles", "CIA"),
+        ("LATAM Pass", "CIA"),
+        ("Azul Fidelidade", "CIA"),
+        ("TAP Miles&Go", "CIA"),
+        ("Iberia Plus", "CIA")
+    ]
+    
+    cursor = conn.cursor()
+    for nome, tipo in programs:
+        # Check if exists
+        exists = cursor.execute("SELECT 1 FROM programs WHERE nome = ?", (nome,)).fetchone()
+        if not exists:
+            cursor.execute("INSERT INTO programs (id, nome, tipo) VALUES (?, ?, ?)", 
+                           (str(uuid.uuid4()), nome, tipo))
+    conn.commit()
+    print("✅ Programas base inseridos.")
 
 def get_conn():
-    if not DB_PATH.exists():
-        raise FileNotFoundError(f"Banco não encontrado em {DB_PATH}. Rode o sistema primeiro.")
+    # Garante que a pasta existe
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
@@ -23,6 +55,11 @@ def clean_db(conn):
 
 def seed_full():
     conn = get_conn()
+    
+    # Inicializa banco se necessário
+    init_schema(conn)
+    seed_programs(conn)
+    
     clean_db(conn) # Começar do zero para este teste
     cursor = conn.cursor()
 

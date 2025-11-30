@@ -1,23 +1,24 @@
 from agno.agent import Agent
-from agno.team import Team
 from agno.models.openai import OpenAIChat
-
-# Importa os especialistas modulares
-from app.agents.specialists.acquisition import acquisition_agent
-from app.agents.specialists.analyst import analyst_agent
+from app.tools.db_manager import DatabaseManager
+# Importamos as funções diretamente agora
+from app.tools.calculators import calculate_mixed_transfer, calculate_cpm 
 
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# O Líder agora é uma instância de TEAM, não de Agent
-milhas_team = Team(
-    name="Equipe WF Milhas",
-    role="Gerente de Atendimento",
+# Instancia as tools com estado (DB)
+db_tool = DatabaseManager()
+
+# Agente Único
+milhas_agent = Agent(
+    name="Gerente WF Milhas",
+    role="Gestor operacional de contas e milhas aéreas",
     model=OpenAIChat(id="gpt-5-mini", api_key=os.getenv("OPENAI_API_KEY")),
-    # A lista de agentes agora entra no parâmetro 'members'
-    members=[acquisition_agent, analyst_agent],
+    # A lista de tools agora mistura a Instância do Toolkit com as Funções Puras
+    tools=[db_tool, calculate_mixed_transfer, calculate_cpm], 
     instructions=[
         "Você é o recepcionista da WF Milhas.",
         "Sua função é entender o pedido e delegar para o especialista correto:",
