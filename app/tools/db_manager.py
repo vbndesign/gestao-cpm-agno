@@ -124,7 +124,100 @@ class DatabaseManager(Toolkit):
 
         except Exception as e:
             return f"❌ Erro de Banco de Dados: {str(e)}"
-            
+
+    def save_complex_transfer(self,
+                            identificador_conta: str,
+                            origem_nome: str,
+                            destino_nome: str,
+                            milhas_base: int,
+                            bonus_percent: float,
+                            lote_organico_qtd: int,
+                            lote_organico_cpm: float,
+                            lote_pago_qtd: int,
+                            lote_pago_custo_total: float,
+                            descricao: str = "Transferência Bonificada") -> str:
+        """
+        Registra uma TRANSFERÊNCIA COMPLEXA (Bônus + Lotes Mistos).
+        Esta função cria a transação principal e divide os custos nos lotes automaticamente.
+        
+        Args:
+            identificador_conta: Nome ou CPF do cliente.
+            origem_nome: Programa de onde saíram os pontos (ex: Livelo).
+            destino_nome: Programa para onde foram (ex: Latam).
+            milhas_base: Quantidade TOTAL transferida (antes do bônus).
+            bonus_percent: Percentual de bônus (ex: 100 para 100%).
+            lote_organico_qtd: Parte das milhas base que já existia (custo baixo/zero).
+            lote_organico_cpm: Custo médio desse lote antigo (geralmente 0).
+            lote_pago_qtd: Parte das milhas base que foi comprada/adquirida agora.
+            lote_pago_custo_total: Valor total pago pelo lote novo.
+            descricao: Texto explicativo.
+        """
+        try:
+            with self._get_conn() as conn:
+                # 1. Validações Básicas
+                acc_id, acc_nome = self._get_account_id(conn, identificador_conta)
+                if not acc_id: return f"❌ Conta '{identificador_conta}' não encontrada."
+
+                orig_id = self._get_program_id(conn, origem_nome)
+                dest_id = self._get_program_id(conn, destino_nome)
+                if not orig_id or not dest_id: return "❌ Programa de origem ou destino não encontrado."
+
+                # Validação Matemática da Soma dos Lotes
+                if (lote_organico_qtd + lote_pago_qtd) != milhas_base:
+                    return f"❌ Erro Matemático: A soma dos lotes ({lote_organico_qtd + lote_pago_qtd}) difere das milhas base informadas ({milhas_base})."
+
+                # 2. Cálculos Financeiros
+                custo_organico = (lote_organico_qtd / 1000) * lote_organico_cpm
+                custo_total = custo_organico + lote_pago_custo_total
+                
+                milhas_creditadas = int(milhas_base * (1 + bonus_percent / 100))
+                
+                cpm_real = 0.0
+                if milhas_creditadas > 0:
+                    cpm_real = (custo_total / milhas_creditadas) * 1000
+
+                # 3. Inserir Transação PAI (Transactions)
+                tx_id = str(uuid.uuid4())
+                conn.execute("""
+                    INSERT INTO transactions 
+                    (id, account_id, data_registro, modo_aquisicao, origem_id, destino_id, companhia_referencia_id,
+                     milhas_base, bonus_percent, milhas_creditadas, custo_total, cpm_real, descricao)
+                    VALUES (?, ?, ?, 'TRANSFERENCIA_BANCO_CIA', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    tx_id, acc_id, date.today(), 
+                    orig_id, dest_id, dest_id,
+                    milhas_base, bonus_percent, milhas_creditadas, 
+                    custo_total, cpm_real, descricao
+                ))
+
+                # 4. Inserir Lotes FILHOS (Batches)
+                
+                # Lote 1: Orgânico (Se existir)
+                if lote_organico_qtd > 0:
+                    conn.execute("""
+                        INSERT INTO transaction_batches (id, transaction_id, tipo, milhas_qtd, cpm_origem, custo_parcial, ordem)
+                        VALUES (?, ?, 'ORGANICO', ?, ?, ?, 1)
+                    """, (str(uuid.uuid4()), tx_id, lote_organico_qtd, lote_organico_cpm, custo_organico))
+
+                # Lote 2: Pago (Se existir)
+                if lote_pago_qtd > 0:
+                    cpm_pago_origem = (lote_pago_custo_total / lote_pago_qtd * 1000) if lote_pago_qtd > 0 else 0
+                    conn.execute("""
+                        INSERT INTO transaction_batches (id, transaction_id, tipo, milhas_qtd, cpm_origem, custo_parcial, ordem)
+                        VALUES (?, ?, 'PAGO', ?, ?, ?, 2)
+                    """, (str(uuid.uuid4()), tx_id, lote_pago_qtd, cpm_pago_origem, lote_pago_custo_total))
+
+                conn.commit()
+
+                return (f"✅ Transferência Complexa Registrada!\n"
+                        f"🆔 ID: {tx_id}\n"
+                        f"🔢 Milhas Creditadas: {milhas_creditadas:,}\n"
+                        f"💰 Custo Total: R$ {custo_total:.2f}\n"
+                        f"📉 **CPM FINAL: R$ {cpm_real:.2f}**")
+
+        except Exception as e:
+            return f"❌ Erro Técnico: {str(e)}"
+
     # Mantenha os outros métodos (register_account, get_programs, get_dashboard_stats) aqui...
     def register_account(self, nome: str, cpf: str) -> str:
         try:
