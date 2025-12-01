@@ -68,7 +68,7 @@ class DatabaseManager(Toolkit):
         PROIBIDO USAR PARA: Transferências com Bônus ou Lotes Mistos.
         Se houver origem diferente do destino ou bônus %, use 'save_complex_transfer'.
         Args:
-            identificador_conta: Nome ou CPF do cliente.
+            identificador_conta: Nome do cliente (ex: 'Ana') ou CPF. Não peça CPF se já tiver o nome.
             programa_nome: Onde as milhas entraram (ex: 'Latam', 'Livelo').
             milhas_quantidade: Total de milhas recebidas.
             custo_total: Valor total pago (coloque 0 se for orgânico).
@@ -121,6 +121,7 @@ class DatabaseManager(Toolkit):
         - Mistura de milhas antigas (Orgânicas) com novas (Pagas).
         
         Args:
+            identificador_conta: Apenas o Primeiro Nome (ex: 'William') ou CPF. O sistema busca automaticamente.
             milhas_base: Total transferido da origem (antes do bônus).
             bonus_percent: O percentual extra ganho (ex: 80).
             lote_organico_qtd: Parte das milhas base que era estoque antigo/grátis.
