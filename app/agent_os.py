@@ -144,7 +144,13 @@ async def slack_events_endpoint(request: Request, background_tasks: BackgroundTa
 def health_check():
     return {"status": "active", "service": "wf-milhas-bot"}
 
+# if __name__ == "__main__":
+    # import uvicorn
+    # Roda o servidor FastAPI para o Slack Bot
+    # uvicorn.run(app, host="0.0.0.0", port=10000, reload=True)
+
 if __name__ == "__main__":
     import uvicorn
-    # Roda o servidor FastAPI para o Slack Bot
-    uvicorn.run(app, host="0.0.0.0", port=10000, reload=True)
+    # Tenta pegar a porta do ambiente (Render). Se não achar, usa 10000 (Local).
+    port = int(os.getenv("PORT", 10000)) 
+    uvicorn.run(app, host="0.0.0.0", port=port)
