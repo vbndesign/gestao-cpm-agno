@@ -12,6 +12,11 @@ load_dotenv()
 # --- CONFIGURAÇÃO DE MEMÓRIA (FIX) ---
 db_url = os.getenv("DATABASE_URL")
 
+# CORREÇÃO CRÍTICA: O SQLAlchemy precisa saber que estamos usando o driver 'psycopg' (v3)
+# Se a string for 'postgresql://', ele tenta usar 'psycopg2' e falha se não tiver.
+if db_url and db_url.startswith("postgresql://"):
+    db_url = db_url.replace("postgresql://", "postgresql+psycopg://")
+
 # Configura o banco de sessões
 session_db = PostgresDb(
     session_table="agent_sessions",
