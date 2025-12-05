@@ -147,4 +147,4 @@ def health_check():
 if __name__ == "__main__":
     import uvicorn
     # Roda o servidor FastAPI para o Slack Bot
-    uvicorn.run(app, host="0.0.0.0", port=7777)
+    uvicorn.run(app, host="0.0.0.0", port=10000, reload=True)
