@@ -15,4 +15,4 @@ app = ag_os.get_app()
 
 if __name__ == "__main__":
     # Roda localmente na porta 7777
-    ag_os.serve(app="app.agent_os:app", host="0.0.0.0", port=7777, reload=True)
+    ag_os.serve(app="app.agent_os:app", host="localhost", port=7777, reload=True)

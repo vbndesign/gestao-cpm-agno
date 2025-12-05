@@ -2,62 +2,68 @@ import os
 from dotenv import load_dotenv
 from agno.agent import Agent
 from agno.models.openai import OpenAIChat
-from agno.db.sqlite import SqliteDb  # <--- Importante para persistência
+from agno.db.postgres import PostgresDb
 
 from app.tools.db_manager import DatabaseManager
 from app.tools.calculators import calculate_mixed_transfer, calculate_cpm 
 
 load_dotenv()
 
-# --- CONFIGURAÇÃO DE MEMÓRIA ---
-# Cria um banco separado apenas para guardar o histórico das conversas
-# Isso é diferente do milhas.db que guarda as transações financeiras
-session_db = SqliteDb(session_table="agent_sessions", db_file="storage/sessions.db")
+# --- CONFIGURAÇÃO DE MEMÓRIA (FIX) ---
+db_url = os.getenv("DATABASE_URL")
+
+# Configura o banco de sessões
+session_db = PostgresDb(
+    session_table="agent_sessions",
+    db_url=db_url
+)
+
+# Garante que a tabela exista (cria se não existir)
+try:
+    session_db._create_all_tables()
+    print("✅ Tabelas do banco de sessões criadas/verificadas com sucesso")
+except Exception as e:
+    print(f"⚠️ Aviso ao criar tabelas: {e}")
 
 # Instancia as tools
 db_tool = DatabaseManager()
 
-# Agente Único (Configurado com gpt-5-mini)
+# Agente Único
 milhas_agent = Agent(
     id="gerente-wf-milhas",
     name="Gerente WF Milhas",
     role="Gestor operacional de contas e milhas aéreas",
     model=OpenAIChat(
-        id="gpt-5-mini", 
+        id="gpt-5-nano", 
         api_key=os.getenv("OPENAI_API_KEY")
     ),
-    # --- PERSISTÊNCIA E MEMÓRIA ---
-    db=session_db,                  # Onde salvar o chat
-    add_history_to_context=True,    # Agente "lê" o que foi dito antes
-    num_history_runs=10,            # Lembra das últimas 10 trocas de mensagem
+    
+    # --- PERSISTÊNCIA ---
+    db=session_db,
+    add_history_to_context=True,    
+    num_history_runs=10,            
     
     # --- TOOLS ---
     tools=[db_tool, calculate_mixed_transfer, calculate_cpm], 
-    # --- INSTRUÇÕES (Mantidas) ---
+    
+    # --- INSTRUÇÕES ---
     instructions=[
         "--- IDENTIDADE ---",
         "Você é o Gerente Operacional da WF Milhas.",
         "Sua missão é registrar a entrada de milhas com precisão matemática e fluidez.",
 
-        "--- PROTOCOLO 0: IDENTIFICAÇÃO INTELIGENTE (SEM BUROCRACIA) ---",
-        "1. Se o usuário disser um NOME (ex: 'Conta do William', 'Para o Roberto'), NÃO peça o CPF.",
-        "2. Assuma que o nome é suficiente e tente executar a ferramenta. O banco de dados buscará pelo nome parcial.",
-        "3. Use o contexto da conversa: Se já estamos falando da conta da 'Ana Paula', continue nela sem perguntar novamente.",
-        "4. SÓ peça o CPF se a ferramenta retornar erro dizendo 'Conta não encontrada'.",
+        "--- PROTOCOLO 0: IDENTIFICAÇÃO INTELIGENTE ---",
+        "1. Se o usuário disser um NOME (ex: 'Conta do William'), NÃO peça o CPF.",
+        "2. Assuma que o nome é suficiente e tente executar a ferramenta.",
+        "3. Use o contexto da conversa para manter a conta ativa.",
+        "4. SÓ peça o CPF se a ferramenta retornar 'Conta não encontrada'.",
 
         "--- PROTOCOLO 1: DECISÃO DE FERRAMENTA ---",
-        "Analise a operação e escolha o caminho:",
-
-        "🚨 CAMINHO A: TRANSFERÊNCIA OU BÔNUS",
-        "Gatilhos: Usuário menciona 'Transferi', 'Bônus', 'Bumerangue', ou 'Lote Misto'.",
-        "AÇÃO: Use 'save_complex_transfer'.",
-        "PROIBIDO: Jamais use 'save_simple_transaction' nestes casos.",
-        "Dados necessários (pergunte se faltar): Origem, Destino, Milhas Base, % Bônus, Composição dos Lotes (Orgânico vs Pago).",
-
-        "🟢 CAMINHO B: COMPRA DIRETA / SIMPLES",
-        "Gatilhos: 'Comprei no site', 'Assinei Clube', 'Fatura do cartão'.",
-        "Condição: NÃO tem bônus de transferência entre programas.",
-        "AÇÃO: Use 'save_simple_transaction'.",
+        "A) TRANSFERÊNCIA / BÔNUS -> Use 'save_complex_transfer'",
+        "   - Gatilhos: 'Transferi', 'Bônus', 'Bumerangue', ou 'Lote Misto'.",
+        
+        "B) COMPRA DIRETA / SIMPLES -> Use 'save_simple_transaction'",
+        "   - Gatilhos: 'Comprei no site', 'Assinei Clube', 'Fatura do cartão'.",
 
         "--- PROTOCOLO 2: CONSULTAS ---",
         "Use 'get_dashboard_stats' para saldos e 'get_programs' para benchmarks.",
