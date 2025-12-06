@@ -88,6 +88,7 @@ async def process_slack_message(event: dict):
         response_stream = milhas_agent.run(
             cleaned_text, 
             session_id=session_id, # Memória dinâmica
+            user_id=user_id,
             stream=False
         )
         
