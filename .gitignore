@@ -5,6 +5,7 @@ dist/
 wheels/
 *.egg-info/
 tmp/*
+agent-ui/
 
 .env
 storage/

@@ -1,46 +1,38 @@
-import os
-from dotenv import load_dotenv
+# app/agents/milhas_agent.py
 from agno.agent import Agent
 from agno.models.openai import OpenAIChat
 from agno.db.postgres import PostgresDb
 
-from app.tools.db_manager import DatabaseManager
+# --- NOVOS IMPORTS DA ARQUITETURA ---
+from app.config.settings import settings
+
+# Import das Tools
+from app.tools.db_toolkit import DatabaseManager
 from app.tools.calculators import calculate_mixed_transfer, calculate_cpm 
 
-load_dotenv()
-
-# --- CONFIGURAÇÃO DE MEMÓRIA (FIX) ---
-db_url = os.getenv("DATABASE_URL")
-
-# CORREÇÃO CRÍTICA: O SQLAlchemy precisa saber que estamos usando o driver 'psycopg' (v3)
-# Se a string for 'postgresql://', ele tenta usar 'psycopg2' e falha se não tiver.
+# --- CONFIGURAÇÃO DE MEMÓRIA ---
+# Prepara a URL do banco para o driver psycopg (v3) usando a config centralizada
+db_url = settings.database_url
 if db_url and db_url.startswith("postgresql://"):
     db_url = db_url.replace("postgresql://", "postgresql+psycopg://")
 
-# Configura o banco de sessões
+# Configura o banco de sessões (Persistência do Chat)
 session_db = PostgresDb(
     session_table="agent_sessions",
     db_url=db_url
 )
 
-# Garante que a tabela exista (cria se não existir)
-try:
-    session_db._create_all_tables()
-    print("✅ Tabelas do banco de sessões criadas/verificadas com sucesso")
-except Exception as e:
-    print(f"⚠️ Aviso ao criar tabelas: {e}")
-
-# Instancia as tools
+# Instancia as tools (Agora usando o Pool de Conexões internamente)
 db_tool = DatabaseManager()
 
-# Agente Único
+# --- DEFINIÇÃO DO AGENTE ---
 milhas_agent = Agent(
     id="gerente-wf-milhas",
     name="Gerente WF Milhas",
     role="Gestor operacional de contas e milhas aéreas",
     model=OpenAIChat(
-        id="gpt-5-nano", 
-        api_key=os.getenv("OPENAI_API_KEY")
+        id="gpt-5-mini",                # <--- CORRIGIDO: Modelo válido e barato
+        api_key=settings.openai_api_key  # <--- CORRIGIDO: Chave segura via Settings
     ),
     
     # --- PERSISTÊNCIA ---
@@ -78,5 +70,5 @@ milhas_agent = Agent(
     ],
     markdown=True,
     add_datetime_to_context=True,
-    debug_mode=True
+    debug_mode=True # Desativado para produção
 )
