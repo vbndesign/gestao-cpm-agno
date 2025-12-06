@@ -1,6 +1,6 @@
 from agno.os import AgentOS
 # Importamos o agente único do arquivo renomeado
-from app.agents.agente_milhas import milhas_agent 
+from app.agents.milhas_agent import milhas_agent 
 from fastapi import FastAPI
 
 ag_os = AgentOS(

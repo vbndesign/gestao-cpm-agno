@@ -4,15 +4,10 @@ from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
 from slack_sdk import WebClient
 from slack_sdk.signature import SignatureVerifier
 
-# --- NOVOS IMPORTS DA ARQUITETURA ---
+# --- IMPORTS DA ARQUITETURA ---
 from app.config.settings import settings
 from app.core.database import Database
-# Import do Agente (Certifique-se que o arquivo está em app/agents/milhas_agent.py ou ajuste aqui)
-try:
-    from app.agents.milhas_agent import milhas_agent
-except ImportError:
-    # Fallback caso você ainda não tenha renomeado o arquivo antigo
-    from app.agents.milhas_agent import milhas_agent
+from app.agents.milhas_agent import milhas_agent
 
 # Configuração de Logs via Settings
 logging.basicConfig(level=settings.log_level)
@@ -40,12 +35,13 @@ verifier = SignatureVerifier(settings.slack_signing_secret)
 
 async def process_slack_message(event: dict):
     """
-    Processa a mensagem em background.
+    Processa mensagens com inteligência de contexto (Thread vs DM).
     """
     user_id = event.get("user")
     text = event.get("text")
     channel_id = event.get("channel")
-    ts = event.get("ts")
+    ts = event.get("ts")             # Timestamp da mensagem atual
+    thread_ts = event.get("thread_ts") # Timestamp da thread (se já existir)
 
     # Validação: Garante que temos channel_id e ts
     if not channel_id or not ts:
@@ -57,40 +53,68 @@ async def process_slack_message(event: dict):
     
     logger.info(f"🤖 Processando mensagem de {user_id}: {cleaned_text[:50]}...")
 
+    # --- ESTRATÉGIA DE MEMÓRIA E ROTEAMENTO ---
+    # Definição de onde responder e qual memória usar
+    if thread_ts:
+        # CASO 1: Mensagem dentro de uma Thread existente
+        # A memória é compartilhada por todos naquela thread
+        session_id = f"thread_{thread_ts}"
+        target_thread = thread_ts
+        context_type = "EXISTING_THREAD"
+        
+    elif channel_id.startswith("D"):
+        # CASO 2: Mensagem Direta (DM)
+        # A memória é pessoal do usuário (contínua)
+        session_id = f"dm_{user_id}"
+        target_thread = None # Em DM não forçamos thread
+        context_type = "DM_PRIVATE"
+        
+    else:
+        # CASO 3: Mensagem solta em Canal Público
+        # Criamos uma NOVA thread para organizar a bagunça
+        session_id = f"thread_{ts}" # A memória nasce com essa mensagem
+        target_thread = ts # Força a resposta a criar o fio
+        context_type = "NEW_THREAD_CHANNEL"
+
+    logger.info(f"🧠 Processando [{context_type}] | Session: {session_id} | User: {user_id}")
+
     try:
-        # Reação: Olhos (Processando)
+        # 1. Reação Visual: Olhos (Processando)
         try:
             slack_client.reactions_add(channel=channel_id, name="eyes", timestamp=ts)
-        except Exception as e:
-            logger.warning(f"Slack Reaction Error: {e}")
+        except: pass
 
-        # --- CHAMADA AO AGENTE ---
-        # Note: O agente já usa o db_toolkit novo internamente
+        # 2. Chamada ao Agente
         response_stream = milhas_agent.run(
             cleaned_text, 
-            session_id=f"slack_{user_id}",
+            session_id=session_id, # Memória dinâmica
             stream=False
         )
         
         response_text = response_stream.content or "Desculpe, fiquei sem resposta."
 
-        # Reação: Check (Sucesso)
+        # 3. Reação Visual: Check (Sucesso)
         try:
             slack_client.reactions_remove(channel=channel_id, name="eyes", timestamp=ts)
             slack_client.reactions_add(channel=channel_id, name="white_check_mark", timestamp=ts)
         except: pass
 
-        # Envia Resposta
+        # 4. Envia Resposta (Na Thread correta ou DM)
         slack_client.chat_postMessage(
             channel=channel_id,
             text=response_text,
+            thread_ts=target_thread, # <--- A Mágica acontece aqui
             mrkdwn=True
         )
 
     except Exception as e:
-        logger.error(f"❌ Erro crítico no processamento: {e}", exc_info=True)
+        logger.error(f"❌ Erro crítico: {e}", exc_info=True)
         try:
-            slack_client.chat_postMessage(channel=channel_id, text=f"⚠️ Erro interno: {str(e)}")
+            slack_client.chat_postMessage(
+                channel=channel_id, 
+                text=f"⚠️ Erro interno: {str(e)}",
+                thread_ts=target_thread # Avisa o erro na thread certa também
+            )
         except: pass
 
 @app.post("/slack/events")
