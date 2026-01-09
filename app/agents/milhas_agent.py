@@ -11,16 +11,16 @@ from app.tools.db_toolkit import DatabaseManager
 from app.tools.calculators import calculate_mixed_transfer, calculate_cpm 
 
 # --- CONFIGURAÇÃO DE MEMÓRIA ---
-# Prepara a URL do banco para o driver psycopg (v3) usando a config centralizada
 db_url = settings.database_url
-if db_url and db_url.startswith("postgresql://"):
-    db_url = db_url.replace("postgresql://", "postgresql+psycopg://")
 
 # Configura o banco de sessões (Persistência do Chat)
 session_db = PostgresDb(
     session_table="agent_sessions",
     db_url=db_url
 )
+
+# só ativa o debug mode se estiver em dev
+debug_mode = (settings.app_env == "dev")
 
 # Instancia as tools (Agora usando o Pool de Conexões internamente)
 db_tool = DatabaseManager()
@@ -70,5 +70,5 @@ milhas_agent = Agent(
     ],
     markdown=True,
     add_datetime_to_context=True,
-    debug_mode=True # Desativado para produção
+    debug_mode=True
 )

@@ -2,7 +2,8 @@ import psycopg
 from datetime import date
 from typing import Optional, Tuple
 from agno.tools import Toolkit
-from app.core.database import Database  # Importa nosso novo Pool Seguro
+from app.core.database import Database
+from app.core.enums import TipoLote, ModoAquisicao
 
 class DatabaseManager(Toolkit):
     def __init__(self):
@@ -29,6 +30,7 @@ class DatabaseManager(Toolkit):
     def _get_account_id(self, conn: psycopg.Connection, identificador: str) -> Tuple[Optional[str], Optional[str]]:
         """Busca ID e Nome da conta por CPF ou Nome parcial."""
         identificador = str(identificador).strip()
+        identificador = identificador.replace("%", "\\%").replace("_", "\\_")
         with conn.cursor() as cur:
             # 1. Tenta CPF exato
             cur.execute("SELECT id, nome FROM accounts WHERE cpf = %s", (identificador,))
@@ -108,17 +110,18 @@ class DatabaseManager(Toolkit):
 
                 # Cálculos
                 cpm_real = (custo_total / milhas_quantidade * 1000) if milhas_quantidade > 0 else 0
-                tipo_lote = "PAGO" if custo_total > 0 else "ORGANICO"
+                tipo_lote = TipoLote.PAGO if custo_total > 0 else TipoLote.ORGANICO
 
                 with conn.cursor() as cur:
                     # 1. Inserir Transação
+                    modo = ModoAquisicao.COMPRA_SIMPLES if custo_total > 0 else ModoAquisicao.ORGANICO
                     cur.execute("""
                         INSERT INTO transactions 
                         (account_id, data_registro, modo_aquisicao, origem_id, destino_id, companhia_referencia_id,
                          milhas_base, bonus_percent, milhas_creditadas, custo_total, cpm_real, descricao)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s)
                         RETURNING id
-                    """, (acc_id, date.today(), 'COMPRA_SIMPLES' if custo_total > 0 else 'ORGANICO', 
+                    """, (acc_id, date.today(), modo.value, 
                           prog_id, prog_id, prog_id, milhas_quantidade, milhas_quantidade, 
                           custo_total, cpm_real, descricao))
                     
@@ -131,7 +134,7 @@ class DatabaseManager(Toolkit):
                     cur.execute("""
                         INSERT INTO transaction_batches (transaction_id, tipo, milhas_qtd, cpm_origem, custo_parcial, ordem)
                         VALUES (%s, %s, %s, %s, %s, 1)
-                    """, (tx_id, tipo_lote, milhas_quantidade, cpm_real, custo_total))
+                    """, (tx_id, tipo_lote.value, milhas_quantidade, cpm_real, custo_total))
                 
                 conn.commit()
                 return f"✅ Transação Salva para {acc_nome}! CPM Final: **R$ {cpm_real:.2f}**"
@@ -171,9 +174,9 @@ class DatabaseManager(Toolkit):
                         INSERT INTO transactions 
                         (account_id, data_registro, modo_aquisicao, origem_id, destino_id, companhia_referencia_id,
                          milhas_base, bonus_percent, milhas_creditadas, custo_total, cpm_real, descricao)
-                        VALUES (%s, %s, 'TRANSFERENCIA_BANCO_CIA', %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         RETURNING id
-                    """, (acc_id, date.today(), orig_id, dest_id, dest_id,
+                    """, (acc_id, date.today(), ModoAquisicao.TRANSFERENCIA.value, orig_id, dest_id, dest_id,
                           milhas_base, bonus_percent, milhas_creditadas, custo_total, cpm_real, descricao))
                     
                     result = cur.fetchone()
@@ -185,15 +188,15 @@ class DatabaseManager(Toolkit):
                     if lote_organico_qtd > 0:
                         cur.execute("""
                             INSERT INTO transaction_batches (transaction_id, tipo, milhas_qtd, cpm_origem, custo_parcial, ordem)
-                            VALUES (%s, 'ORGANICO', %s, %s, %s, 1)
-                        """, (tx_id, lote_organico_qtd, lote_organico_cpm, custo_organico))
+                            VALUES (%s, %s, %s, %s, %s, 1)
+                        """, (tx_id, TipoLote.ORGANICO.value, lote_organico_qtd, lote_organico_cpm, custo_organico))
                     
                     if lote_pago_qtd > 0:
                         cpm_pago = (lote_pago_custo_total / lote_pago_qtd * 1000)
                         cur.execute("""
                             INSERT INTO transaction_batches (transaction_id, tipo, milhas_qtd, cpm_origem, custo_parcial, ordem)
-                            VALUES (%s, 'PAGO', %s, %s, %s, 2)
-                        """, (tx_id, lote_pago_qtd, cpm_pago, lote_pago_custo_total))
+                            VALUES (%s, %s, %s, %s, %s, 2)
+                        """, (tx_id, TipoLote.PAGO.value, lote_pago_qtd, cpm_pago, lote_pago_custo_total))
 
                 conn.commit()
                 return f"✅ Transferência Salva para {acc_nome}! CPM Final: **R$ {cpm_real:.2f}**"

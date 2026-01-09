@@ -159,13 +159,18 @@ async def slack_events_endpoint(request: Request, background_tasks: BackgroundTa
 
 @app.get("/health")
 def health_check():
-    """
-    Health Check para o Render saber que estamos vivos.
-    """
+    try:
+        with Database.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+        db_status = "connected"
+    except Exception:
+        db_status = "disconnected"
+    
     return {
-        "status": "active", 
-        "env": settings.app_env, 
-        "service": "wf-milhas-bot"
+        "status": "active",
+        "database": db_status,
+        "env": settings.app_env
     }
 
 if __name__ == "__main__":
