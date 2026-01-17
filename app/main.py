@@ -176,4 +176,4 @@ def health_check():
 if __name__ == "__main__":
     import uvicorn
     # Usa a porta configurada no settings (lê PORT do Render ou 10000 padrão)
-    uvicorn.run(app, host="0.0.0.0", port=settings.port)
+    uvicorn.run("app.main:app", host="0.0.0.0", port=settings.port, reload=True)
