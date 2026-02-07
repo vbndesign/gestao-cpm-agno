@@ -20,6 +20,7 @@ class DatabaseManager(Toolkit):
         # self.register(self.prepare_complex_transfer) # DESABILITADA: Validação prévia (economiza tokens)
         self.register(self.save_complex_transfer)
         self.register(self.get_dashboard)
+        self.register(self.register_subscription)
 
     def _get_conn(self):
         """
@@ -450,3 +451,59 @@ class DatabaseManager(Toolkit):
             return res
 
         except Exception as e: return f"❌ Erro ao consultar dashboard: {str(e)}"
+
+    def register_subscription(self,
+                            nome_conta: str, 
+                            nome_programa: str, 
+                            valor_total_ciclo: float, 
+                            milhas_garantidas_ciclo: int, 
+                            data_renovacao: str) -> str:
+        """
+        Registra uma assinatura de Clube (recorrência mensal/anual).
+        O CPM é calculado automaticamente pelo banco de dados.
+        data_renovacao: Data de renovação em linguagem natural (ex: '15 de janeiro de 2027').
+        """
+        try:
+            # Parse e validação de data
+            data_renov_dt = parse_date_natural(data_renovacao)
+            if not data_renov_dt:
+                return f"❌ Erro: Não consegui interpretar a data '{data_renovacao}'. Use formatos como 'DD/MM/AAAA' ou 'DD de mês de AAAA'."
+            
+            if data_renov_dt <= date.today():
+                return f"❌ Erro: A data de renovação ({data_renovacao}) deve ser no futuro."
+
+            # Validações de entrada
+            if valor_total_ciclo <= 0:
+                return "❌ Erro: valor_total_ciclo deve ser maior que zero."
+            if milhas_garantidas_ciclo <= 0:
+                return "❌ Erro: milhas_garantidas_ciclo deve ser maior que zero."
+
+            with self._get_conn() as conn:
+                acc_id, acc_nome = self._get_account_id(conn, nome_conta)
+                if not acc_id: 
+                    return f"❌ Conta '{nome_conta}' não encontrada."
+                
+                prog_id = self._get_program_id(conn, nome_programa)
+                if not prog_id: 
+                    return f"❌ Programa '{nome_programa}' não encontrado."
+                
+                with conn.cursor() as cur:
+                    # Inserção com retorno do CPM calculado
+                    cur.execute("""
+                        INSERT INTO subscriptions 
+                        (account_id, programa_id, valor_total_ciclo, milhas_garantidas_ciclo, data_inicio, data_renovacao)
+                        VALUES (%s, %s, %s, %s, CURRENT_DATE, %s)
+                        RETURNING cpm_fixo
+                    """, (acc_id, prog_id, valor_total_ciclo, milhas_garantidas_ciclo, data_renov_dt),
+                         prepare=False)
+                    
+                    result = cur.fetchone()
+                    if not result:
+                        return "❌ Erro: Não foi possível criar a assinatura."
+                    cpm_calculado = result[0]
+                
+                conn.commit()
+                return f"✅ Assinatura registrada para {acc_nome}! CPM Fixo: **R$ {cpm_calculado:.2f}** • Renovação: {data_renov_dt.strftime('%d/%m/%Y')}"
+                
+        except Exception as e:
+            return f"❌ Erro ao registrar assinatura: {str(e)}"
