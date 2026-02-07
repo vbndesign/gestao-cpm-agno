@@ -5,6 +5,7 @@ from typing import Optional, Tuple
 from agno.tools import Toolkit
 from app.core.database import Database
 from app.core.enums import TipoLote, ModoAquisicao
+from app.tools.date_parser import parse_date_natural
 
 class DatabaseManager(Toolkit):
     def __init__(self):
@@ -182,12 +183,19 @@ class DatabaseManager(Toolkit):
                               programa_nome: str, 
                               milhas_quantidade: int, 
                               custo_total: float, 
+                              data_transacao: Optional[str] = None,
                               observacao: Optional[str] = None) -> str:
         """
         Registra uma compra simples de milhas ou entrada orgânica.
+        data_transacao: Data da transação em linguagem natural (ex: 'hoje', 'ontem', '17/03/2026'). Se omitido, usa data atual.
         observacao: Observação opcional fornecida pelo usuário.
         """
         try:
+            # Parse e validação de data
+            data_tx = parse_date_natural(data_transacao) if data_transacao else date.today()
+            if not data_tx:
+                return f"❌ Erro: Não consegui interpretar a data '{data_transacao}'. Use formatos como 'hoje', 'ontem', 'DD/MM/AAAA' ou 'DD de mês de AAAA'."
+            
             with self._get_conn() as conn:
                 # Validações dentro da mesma conexão
                 acc_id, acc_nome = self._get_account_id(conn, identificador_conta)
@@ -207,11 +215,11 @@ class DatabaseManager(Toolkit):
                     descricao = f"{modo.value}: {milhas_quantidade:,} milhas em {programa_nome}"
                     cur.execute("""
                         INSERT INTO transactions 
-                        (account_id, data_registro, modo_aquisicao, origem_id, destino_id, companhia_referencia_id,
+                        (account_id, data_registro, data_transacao, modo_aquisicao, origem_id, destino_id, companhia_referencia_id,
                          milhas_base, bonus_percent, milhas_creditadas, custo_total, cpm_real, descricao, observacao)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s)
                         RETURNING id
-                    """, (acc_id, date.today(), modo.value, 
+                    """, (acc_id, date.today(), data_tx, modo.value, 
                           prog_id, prog_id, prog_id, milhas_quantidade, milhas_quantidade, 
                           custo_total, cpm_real, descricao, observacao),
                           prepare=False)
@@ -322,12 +330,19 @@ class DatabaseManager(Toolkit):
                             lote_organico_cpm: float,
                             lote_pago_qtd: int,
                             lote_pago_custo_total: float,
+                            data_transacao: Optional[str] = None,
                             observacao: Optional[str] = None) -> str:
         """
         Registra uma transferência bonificada com composição de lotes (Orgânico + Pago).
+        data_transacao: Data da transação em linguagem natural (ex: 'hoje', 'ontem', '17/03/2026'). Se omitido, usa data atual.
         observacao: Observação opcional fornecida pelo usuário.
         """
         try:
+            # Parse e validação de data
+            data_tx = parse_date_natural(data_transacao) if data_transacao else date.today()
+            if not data_tx:
+                return f"❌ Erro: Não consegui interpretar a data '{data_transacao}'. Use formatos como 'hoje', 'ontem', 'DD/MM/AAAA' ou 'DD de mês de AAAA'."
+            
             with self._get_conn() as conn:
                 acc_id, acc_nome = self._get_account_id(conn, identificador_conta)
                 if not acc_id: return f"❌ Conta '{identificador_conta}' não encontrada."
@@ -364,11 +379,11 @@ class DatabaseManager(Toolkit):
                     # Desabilita prepared statements para evitar conflitos
                     cur.execute("""
                         INSERT INTO transactions 
-                        (account_id, data_registro, modo_aquisicao, origem_id, destino_id, companhia_referencia_id,
+                        (account_id, data_registro, data_transacao, modo_aquisicao, origem_id, destino_id, companhia_referencia_id,
                          milhas_base, bonus_percent, milhas_creditadas, custo_total, cpm_real, descricao, observacao)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         RETURNING id
-                    """, (acc_id, date.today(), ModoAquisicao.TRANSFERENCIA.value, orig_id, dest_id, dest_id,
+                    """, (acc_id, date.today(), data_tx, ModoAquisicao.TRANSFERENCIA.value, orig_id, dest_id, dest_id,
                           milhas_base, bonus_percent, milhas_creditadas, custo_total, cpm_real, descricao, observacao),
                           prepare=False)
                     
