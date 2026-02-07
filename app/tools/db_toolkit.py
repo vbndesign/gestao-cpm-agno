@@ -182,66 +182,83 @@ class DatabaseManager(Toolkit):
         except Exception as e: return f"Erro ao buscar programas: {str(e)}"
 
     def save_simple_transaction(self, 
-                              identificador_conta: str, 
-                              programa_nome: str, 
-                              milhas_quantidade: int, 
-                              custo_total: float, 
+                              nome_conta: str, 
+                              nome_programa: str, 
+                              milhas: int, 
+                              custo_total: float,
+                              bonus_percent: float = 0.0,
                               data_transacao: Optional[str] = None,
                               observacao: Optional[str] = None) -> str:
         """
         Registra uma compra simples de milhas ou entrada orgânica.
-        data_transacao: Data da transação em linguagem natural (ex: 'hoje', 'ontem', '17/03/2026'). Se omitido, usa data atual.
-        observacao: Observação opcional fornecida pelo usuário.
+        AGORA SUPORTA CÁLCULO DE BÔNUS AUTOMÁTICO.
+        
+        Args:
+            bonus_percent: Percentual de bônus (ex: 25 para 25%)
+            data_transacao: Data em formato padrão. IMPORTANTE: Quando o usuário usar 
+                expressões relativas complexas (ex: "daqui 1 ano"), converta você mesmo 
+                calculando a data exata e passe no formato DD/MM/AAAA ou DD/MM. 
+                Exemplo: "daqui 1 ano" de 07/02/2026 = passe "07/02/2027".
+                Se omitido, usa data atual.
+            observacao: Observação livre do usuário
         """
         try:
-            # Parse e validação de data
+            # 1. Parse de data
             data_tx = parse_date_natural(data_transacao) if data_transacao else date.today()
             if not data_tx:
-                return f"❌ Erro: Não consegui interpretar a data '{data_transacao}'. Use formatos como 'hoje', 'ontem', 'DD/MM/AAAA' ou 'DD de mês de AAAA'."
+                return f"❌ Erro: Não consegui interpretar a data '{data_transacao}'."
+            
+            # 2. Cálculo de bônus
+            milhas_base = int(milhas)
+            bonus = float(bonus_percent)
+            total_milhas = int(milhas_base * (1 + bonus / 100))
+            
+            # 3. Define modo e descrição
+            if custo_total <= 0:
+                modo = ModoAquisicao.ORGANICO
+                custo_final = 0.0
+                tag_bonus = f" + {int(bonus)}% bônus" if bonus > 0 else ""
+                descricao = f"Entrada Orgânica: {total_milhas:,} milhas{tag_bonus} em {nome_programa}"
+            else:
+                modo = ModoAquisicao.COMPRA_SIMPLES
+                custo_final = float(custo_total)
+                tag_bonus = f" (com {int(bonus)}% bônus)" if bonus > 0 else ""
+                descricao = f"Compra Simples: {milhas_base:,} milhas{tag_bonus} em {nome_programa}"
             
             with self._get_conn() as conn:
-                # Validações dentro da mesma conexão
-                acc_id, acc_nome = self._get_account_id(conn, identificador_conta)
-                if not acc_id: return f"❌ Conta '{identificador_conta}' não encontrada."
+                acc_id, acc_nome = self._get_account_id(conn, nome_conta)
+                if not acc_id: return f"❌ Conta '{nome_conta}' não encontrada."
                 
-                prog_id = self._get_program_id(conn, programa_nome)
-                if not prog_id: return f"❌ Programa '{programa_nome}' não encontrado."
-
-                # Cálculos
-                cpm_real = (custo_total / milhas_quantidade * 1000) if milhas_quantidade > 0 else 0
-                tipo_lote = TipoLote.PAGO if custo_total > 0 else TipoLote.ORGANICO
-
+                prog_id = self._get_program_id(conn, nome_programa)
+                if not prog_id: return f"❌ Programa '{nome_programa}' não encontrado."
+                
+                # 4. CPM Real baseado no total creditado
+                cpm_real = (custo_final / total_milhas * 1000) if total_milhas > 0 else 0
+                
                 with conn.cursor() as cur:
-                    # 1. Inserir Transação
-                    modo = ModoAquisicao.COMPRA_SIMPLES if custo_total > 0 else ModoAquisicao.ORGANICO
-                    # Descrição sempre gerada automaticamente
-                    descricao = f"{modo.value}: {milhas_quantidade:,} milhas em {programa_nome}"
+                    # ✅ CORREÇÃO: subscription_id explícito como None (NULL)
                     cur.execute("""
                         INSERT INTO transactions 
                         (account_id, data_registro, data_transacao, modo_aquisicao, origem_id, destino_id, companhia_referencia_id,
-                         milhas_base, bonus_percent, milhas_creditadas, custo_total, cpm_real, descricao, observacao)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s)
-                        RETURNING id
+                         milhas_base, bonus_percent, milhas_creditadas, custo_total, cpm_real, descricao, observacao, subscription_id)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """, (acc_id, date.today(), data_tx, modo.value, 
-                          prog_id, prog_id, prog_id, milhas_quantidade, milhas_quantidade, 
-                          custo_total, cpm_real, descricao, observacao),
+                          prog_id, prog_id, prog_id, 
+                          milhas_base, bonus, total_milhas, 
+                          custo_final, cpm_real, descricao, observacao, None),
                           prepare=False)
                     
-                    result = cur.fetchone()
-                    if not result:
-                        return "❌ Erro: Não foi possível criar a transação."
-                    tx_id = result[0]
-
-                    # 2. Inserir Lote Único
-                    cur.execute("""
-                        INSERT INTO transaction_batches (transaction_id, tipo, milhas_qtd, cpm_origem, custo_parcial, ordem)
-                        VALUES (%s, %s, %s, %s, %s, 1)
-                    """, (tx_id, tipo_lote.value, milhas_quantidade, cpm_real, custo_total),
-                         prepare=False)
-                
-                conn.commit()
-                return f"✅ Transação Salva para {acc_nome}! CPM Final: **R$ {cpm_real:.2f}**"
-        except Exception as e: return f"❌ Erro ao salvar transação: {str(e)}"
+                    conn.commit()
+                    
+                    msg_bonus = f"\n🎁 **Bônus:** {int(bonus)}% aplicado" if bonus > 0 else ""
+                    return (
+                        f"✅ Transação Salva para {acc_nome}!{msg_bonus}\n"
+                        f"📊 **Milhas Creditadas:** {total_milhas:,}\n"
+                        f"💰 **CPM Final:** R$ {cpm_real:.2f}"
+                    )
+            
+        except Exception as e: 
+            return f"❌ Erro ao salvar transação: {str(e)}"
 
     # ============================================================================
     # FUNÇÃO DESABILITADA: prepare_complex_transfer
@@ -337,8 +354,12 @@ class DatabaseManager(Toolkit):
                             observacao: Optional[str] = None) -> str:
         """
         Registra uma transferência bonificada com composição de lotes (Orgânico + Pago).
-        data_transacao: Data da transação em linguagem natural (ex: 'hoje', 'ontem', '17/03/2026'). Se omitido, usa data atual.
-        observacao: Observação opcional fornecida pelo usuário.
+        
+        Args:
+            data_transacao: Data em formato padrão. Para expressões relativas complexas 
+                (ex: "daqui 1 ano"), converta calculando a data exata e passe DD/MM/AAAA. 
+                Se omitido, usa data atual.
+            observacao: Observação opcional fornecida pelo usuário.
         """
         try:
             # Parse e validação de data
@@ -459,25 +480,55 @@ class DatabaseManager(Toolkit):
                             nome_programa: str, 
                             valor_total_ciclo: float, 
                             milhas_garantidas_ciclo: int, 
-                            data_renovacao: str) -> str:
+                            data_renovacao: str,
+                            data_inicio: Optional[str] = None,
+                            is_mensal: bool = False) -> str:
         """
         Registra uma assinatura de Clube (recorrência mensal/anual).
         O CPM é calculado automaticamente pelo banco de dados.
-        data_renovacao: Data de renovação em linguagem natural (ex: '15 de janeiro de 2027').
+        
+        Args:
+            valor_total_ciclo: Valor monetário do ciclo (mensal ou anual, dependendo de is_mensal).
+            milhas_garantidas_ciclo: Quantidade de milhas do ciclo (mensal ou anual).
+            data_renovacao: Data de renovação FUTURA. Aceita linguagem natural:
+                'daqui a 1 ano', '07/02/2027', '7 de fevereiro de 2027'.
+            data_inicio: Data de início da assinatura (opcional). Se não informada, usa hoje.
+                Pode ser no passado. Aceita linguagem natural: '15 de janeiro', '01/01/2026'.
+            is_mensal: Se True, multiplica os valores por 12 para criar o contrato anual.
+                Use True quando o usuário informar valores mensais (ex: "R$40 por mês").
+                Use False quando o usuário informar valores anuais/totais.
         """
         try:
-            # Parse e validação de data
-            data_renov_dt = parse_date_natural(data_renovacao)
-            if not data_renov_dt:
-                return f"❌ Erro: Não consegui interpretar a data '{data_renovacao}'. Use formatos como 'DD/MM/AAAA' ou 'DD de mês de AAAA'."
+            # Parse e validação de data de início
+            if data_inicio:
+                dt_inicio = parse_date_natural(data_inicio, prefer_future=False)
+                if not dt_inicio:
+                    return f"❌ Erro: Não consegui interpretar a data de início '{data_inicio}'. Use formatos como 'DD/MM/AAAA' ou 'DD de mês de AAAA'."
+            else:
+                dt_inicio = date.today()
             
-            if data_renov_dt <= date.today():
-                return f"❌ Erro: A data de renovação ({data_renovacao}) deve ser no futuro."
+            # Parse e validação de data de renovação (com preferência por futuro)
+            data_renov_dt = parse_date_natural(data_renovacao, prefer_future=True)
+            if not data_renov_dt:
+                return f"❌ Erro: Não consegui interpretar a data de renovação '{data_renovacao}'. Use formatos como 'daqui a 1 ano', 'DD/MM/AAAA' ou 'DD de mês de AAAA'."
+            
+            if data_renov_dt <= dt_inicio:
+                return f"❌ Erro: A data de renovação deve ser posterior à data de início. Início: {dt_inicio.strftime('%d/%m/%Y')}, Renovação: {data_renov_dt.strftime('%d/%m/%Y')}."
+
+            # Lógica de Anualização (Cálculo seguro no Python)
+            if is_mensal:
+                valor_contrato = float(valor_total_ciclo) * 12
+                milhas_contrato = int(milhas_garantidas_ciclo) * 12
+                tipo_contrato = "MENSAL (Anualizado x12)"
+            else:
+                valor_contrato = float(valor_total_ciclo)
+                milhas_contrato = int(milhas_garantidas_ciclo)
+                tipo_contrato = "ANUAL (Valor Cheio)"
 
             # Validações de entrada
-            if valor_total_ciclo <= 0:
+            if valor_contrato <= 0:
                 return "❌ Erro: valor_total_ciclo deve ser maior que zero."
-            if milhas_garantidas_ciclo <= 0:
+            if milhas_contrato <= 0:
                 return "❌ Erro: milhas_garantidas_ciclo deve ser maior que zero."
 
             with self._get_conn() as conn:
@@ -490,13 +541,14 @@ class DatabaseManager(Toolkit):
                     return f"❌ Programa '{nome_programa}' não encontrado."
                 
                 with conn.cursor() as cur:
-                    # Inserção com retorno do CPM calculado
+                    # Inserção com retorno do CPM calculado (usando valores do contrato)
+                    # Nota: data_fim é deixada NULL (assinatura ativa). Será preenchida apenas quando o contrato encerrar.
                     cur.execute("""
                         INSERT INTO subscriptions 
-                        (account_id, programa_id, valor_total_ciclo, milhas_garantidas_ciclo, data_inicio, data_renovacao)
-                        VALUES (%s, %s, %s, %s, CURRENT_DATE, %s)
+                        (account_id, programa_id, valor_total_ciclo, milhas_garantidas_ciclo, data_inicio, data_renovacao, ativo)
+                        VALUES (%s, %s, %s, %s, %s, %s, TRUE)
                         RETURNING cpm_fixo
-                    """, (acc_id, prog_id, valor_total_ciclo, milhas_garantidas_ciclo, data_renov_dt),
+                    """, (acc_id, prog_id, valor_contrato, milhas_contrato, dt_inicio, data_renov_dt),
                          prepare=False)
                     
                     result = cur.fetchone()
@@ -505,7 +557,17 @@ class DatabaseManager(Toolkit):
                     cpm_calculado = result[0]
                 
                 conn.commit()
-                return f"✅ Assinatura registrada para {acc_nome}! CPM Fixo: **R$ {cpm_calculado:.2f}** • Renovação: {data_renov_dt.strftime('%d/%m/%Y')}"
+                return (
+                    f"✅ **Assinatura Criada com Sucesso!**\n"
+                    f"📋 **Tipo:** {tipo_contrato}\n"
+                    f"📊 **Contrato Anual:** {milhas_contrato:,} milhas\n"
+                    f"💰 **Valor Global:** R$ {valor_contrato:.2f}\n"
+                    f"📉 **CPM Travado:** R$ {cpm_calculado:.2f}\n"
+                    f"� **Início:** {dt_inicio.strftime('%d/%m/%Y')}\n"
+                    f"�🔄 **Renovação:** {data_renov_dt.strftime('%d/%m/%Y')}\n"                    
+                    f"✅ **Status:** Ativo\n"                    
+                    f"ℹ️ *Nota: O sistema baixará 1/12 desse saldo a cada mensalidade.*"
+                )
                 
         except Exception as e:
             return f"❌ Erro ao registrar assinatura: {str(e)}"
@@ -516,10 +578,19 @@ class DatabaseManager(Toolkit):
                                 nome_programa: str, 
                                 valor_total_ciclo: float, 
                                 milhas_garantidas_ciclo: int, 
-                                data_renovacao: str) -> str:
+                                data_renovacao: str,
+                                data_inicio: Optional[str] = None,
+                                is_mensal: bool = False) -> str:
         """
         CORREÇÃO: Apaga a última assinatura registrada para esta conta e insere a nova com os dados corrigidos.
         Use ISSO quando o usuário disser 'Errei o valor', 'Corrige a data', etc.
+        
+        Args:
+            valor_total_ciclo: Valor monetário do ciclo (mensal ou anual, dependendo de is_mensal).
+            milhas_garantidas_ciclo: Quantidade de milhas do ciclo (mensal ou anual).
+            data_renovacao: Data de renovação FUTURA. Aceita linguagem natural.
+            data_inicio: Data de início da assinatura (opcional). Pode ser no passado.
+            is_mensal: Se True, multiplica os valores por 12 para criar o contrato anual.
         """
         try:
             # 1. Tratamento da Data (Reutilizando sua função auxiliar)
@@ -558,7 +629,9 @@ class DatabaseManager(Toolkit):
                 nome_programa, 
                 valor_total_ciclo, 
                 milhas_garantidas_ciclo, 
-                data_renovacao
+                data_renovacao,
+                data_inicio,
+                is_mensal
             )
             
             return f"{resultado_novo} {msg_delecao}"
@@ -674,36 +747,38 @@ class DatabaseManager(Toolkit):
                                       nome_programa: str, 
                                       milhas: int, 
                                       custo_total: float,
-                                      descricao: str) -> str:
+                                      descricao: str,
+                                      bonus_percent: float = 0.0) -> str: # <--- Novo Parâmetro
         """
-        Registra transações AVULSAS (Não-Recorrentes) feitas DENTRO do ambiente do Clube.
-        Exemplos: 
-        1. Compra de pontos com desconto de assinante (Custo > 0).
-        2. Bônus orgânico/aniversário do clube (Custo = 0).
-        
-        DIFERENÇA: Esta função VINCULA a transação ao ID da Assinatura (subscription_id),
-        permitindo rastrear que o benefício veio do Clube.
+        Registra transações intra-clube.
+        Agora aceita 'bonus_percent' para que o Python faça o cálculo final de milhas.
         """
         try:
-            # 1. Define o Modo e a Tag de Descrição baseada no Custo
+            # 1. Cálculo Deterministico (Python)
+            milhas_base = int(milhas)
+            bonus = float(bonus_percent)
+            
+            # Fórmula: Base + (Base * (Bonus/100))
+            total_milhas = int(milhas_base * (1 + bonus / 100))
+            
+            # Define Modo
             if custo_total <= 0:
-                modo = "ORGANICO" # Ou ModoAquisicao.ORGANICO.value
+                modo = "ORGANICO" # ModoAquisicao.ORGANICO.value
                 custo_final = 0.0
                 tag_desc = "(Bônus/Orgânico Clube)"
             else:
-                modo = "COMPRA_SIMPLES" # Ou ModoAquisicao.COMPRA_SIMPLES.value
+                modo = "COMPRA_SIMPLES" # ModoAquisicao.COMPRA_SIMPLES.value
                 custo_final = float(custo_total)
-                tag_desc = "(Compra Promocional Clube)"
+                tag_desc = f"(Compra Clube + {int(bonus)}% Bônus)"
 
             with self._get_conn() as conn:
                 acc_id, acc_nome = self._get_account_id(conn, nome_conta)
                 if not acc_id: return f"❌ Conta '{nome_conta}' não encontrada."
 
-                prog_id = self._get_program_id(conn, nome_programa) # Usando seu helper corrigido
+                prog_id = self._get_program_id(conn, nome_programa)
                 if not prog_id: return f"❌ Programa '{nome_programa}' não encontrado."
 
                 with conn.cursor() as cur:
-                    # 2. Busca a Assinatura ATIVA (Obrigatório ter clube para usar essa função)
                     cur.execute("""
                         SELECT id FROM subscriptions
                         WHERE account_id = %s AND programa_id = %s AND ativo = TRUE
@@ -712,41 +787,42 @@ class DatabaseManager(Toolkit):
                     
                     sub = cur.fetchone()
                     if not sub:
-                        return f"❌ Operação negada: O cliente {acc_nome} não tem Clube Ativo na {nome_programa} para realizar operações vinculadas."
-                    
+                        return f"❌ Operação negada: Cliente sem Clube Ativo na {nome_programa}."
                     sub_id = sub[0]
 
-                    # 3. Calcula CPM Real dessa operação específica
-                    cpm_transacao = (custo_final / milhas * 1000) if milhas > 0 else 0
+                    # CPM Real baseado no TOTAL creditado
+                    cpm_transacao = (custo_final / total_milhas * 1000) if total_milhas > 0 else 0
 
-                    # 4. Insert VINCULADO (subscription_id preenchido)
                     full_desc = f"{descricao} {tag_desc}"
                     
+                    # Insert completo preenchendo as colunas de Base e Bônus separadas
                     cur.execute("""
                         INSERT INTO transactions 
                         (account_id, data_registro, data_transacao, modo_aquisicao, origem_id, destino_id, companhia_referencia_id,
                          milhas_base, bonus_percent, milhas_creditadas, custo_total, cpm_real, descricao, subscription_id)
-                        VALUES (%s, CURRENT_DATE, CURRENT_DATE, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s)
+                        VALUES (%s, CURRENT_DATE, CURRENT_DATE, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """, (
                         acc_id, 
                         modo, 
                         prog_id, prog_id, prog_id,
-                        milhas, 
-                        milhas, 
+                        milhas_base,   # Coluna milhas_base
+                        bonus,         # Coluna bonus_percent
+                        total_milhas,  # Coluna milhas_creditadas (Calculado pelo Python)
                         custo_final, 
                         cpm_transacao, 
                         full_desc, 
-                        sub_id # <--- O Grande Diferencial: Vinculado ao Clube
+                        sub_id
                     ))
                     
                     conn.commit()
                     
                     return (
-                        f"✅ Transação Intra-Clube registrada!\n"
-                        f"🎯 Contexto: {tag_desc}\n"
-                        f"📊 +{milhas} milhas\n"
-                        f"💰 Custo: R$ {custo_final:.2f} (CPM R$ {cpm_transacao:.2f})"
+                        f"✅ **Transação Intra-Clube Registrada!**\n"
+                        f"🔢 **Estrutura:** {milhas_base} milhas + {int(bonus)}% bônus\n"
+                        f"🛒 **Total Creditado:** {total_milhas} milhas\n"
+                        f"💸 **Custo:** R$ {custo_final:.2f}\n"
+                        f"📉 **CPM:** R$ {cpm_transacao:.2f}"
                     )
 
         except Exception as e:
-            return f"❌ Erro ao registrar intra-clube: {str(e)}"
+            return f"❌ Erro: {str(e)}"
