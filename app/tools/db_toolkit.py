@@ -21,6 +21,8 @@ class DatabaseManager(Toolkit):
         self.register(self.save_complex_transfer)
         self.register(self.get_dashboard)
         self.register(self.register_subscription)
+        self.register(self.correct_last_subscription)
+        self.register(self.process_monthly_credit)
 
     def _get_conn(self):
         """
@@ -507,3 +509,244 @@ class DatabaseManager(Toolkit):
                 
         except Exception as e:
             return f"❌ Erro ao registrar assinatura: {str(e)}"
+        
+
+    def correct_last_subscription(self, 
+                                nome_conta: str, 
+                                nome_programa: str, 
+                                valor_total_ciclo: float, 
+                                milhas_garantidas_ciclo: int, 
+                                data_renovacao: str) -> str:
+        """
+        CORREÇÃO: Apaga a última assinatura registrada para esta conta e insere a nova com os dados corrigidos.
+        Use ISSO quando o usuário disser 'Errei o valor', 'Corrige a data', etc.
+        """
+        try:
+            # 1. Tratamento da Data (Reutilizando sua função auxiliar)
+            # Precisamos importar parse_date_natural ou tê-la disponível aqui
+            # data_renov_dt = parse_date_natural(data_renovacao) ... (se não tiver a validação aqui, o register vai fazer)
+
+            with self._get_conn() as conn:
+                # --- AQUI ESTÁ A LÓGICA DO NOME ---
+                # Usamos o nome para descobrir o ID
+                acc_id, acc_nome = self._get_account_id(conn, nome_conta)
+                if not acc_id: return f"❌ Conta '{nome_conta}' não encontrada."
+
+                with conn.cursor() as cur:
+                    # 2. DELETA A ÚLTIMA ASSINATURA (Limpeza)
+                    # Busca a última criada baseada no timestamp para aquele ID
+                    cur.execute("""
+                        DELETE FROM subscriptions 
+                        WHERE id = (
+                            SELECT id FROM subscriptions 
+                            WHERE account_id = %s 
+                            ORDER BY created_at DESC 
+                            LIMIT 1
+                        )
+                        RETURNING id;
+                    """, (acc_id,))
+                    
+                    deleted = cur.fetchone()
+                    msg_delecao = "(Anterior apagada 🗑️)" if deleted else "(Nenhuma anterior encontrada para apagar)"
+                
+                conn.commit() # Confirma a exclusão antes de tentar inserir a nova
+            
+            # 3. CHAMA A FUNÇÃO DE REGISTRO NORMAL
+            # Agora chamamos a função 'irmã' para recriar o registro limpo
+            resultado_novo = self.register_subscription(
+                nome_conta, 
+                nome_programa, 
+                valor_total_ciclo, 
+                milhas_garantidas_ciclo, 
+                data_renovacao
+            )
+            
+            return f"{resultado_novo} {msg_delecao}"
+
+        except Exception as e:
+            return f"❌ Erro ao corrigir: {str(e)}"
+        
+    def process_monthly_credit(self, nome_conta: str, nome_programa: str, milhas_do_mes: int = 0) -> str:
+        """
+        Registra a entrada mensal (Recorrência) com TRAVA DE SEGURANÇA.
+        Não permite creditar mais milhas do que o total contratado na assinatura.
+        """
+        try:
+            with self._get_conn() as conn:
+                acc_id, acc_nome = self._get_account_id(conn, nome_conta)
+                if not acc_id: return f"❌ Conta '{nome_conta}' não encontrada."
+
+                prog_id = self._get_program_id(conn, nome_programa)
+                if not prog_id: return f"❌ Programa '{nome_programa}' não encontrado."
+
+                with conn.cursor() as cur:
+                    # 1. Busca os dados do CONTRATO
+                    cur.execute("""
+                        SELECT id, cpm_fixo, milhas_garantidas_ciclo, valor_total_ciclo 
+                        FROM subscriptions
+                        WHERE account_id = %s AND programa_id = %s AND ativo = TRUE
+                        LIMIT 1
+                    """, (acc_id, prog_id))
+                    
+                    sub = cur.fetchone()
+                    if not sub: return f"❌ Nenhuma assinatura ativa encontrada para {acc_nome} no programa {nome_programa}."
+                    
+                    sub_id, cpm_fixo, milhas_totais_contrato, valor_anual = sub
+
+                    # 2. Define a Quantidade
+                    if milhas_do_mes > 0:
+                        qtd_inserir = milhas_do_mes
+                        obs_origem = "(Manual)"
+                    else:
+                        qtd_inserir = int(milhas_totais_contrato / 12)
+                        obs_origem = "(Média linear)"
+
+                    # --- 🛡️ TRAVA DE SEGURANÇA ---
+                    cur.execute("""
+                        SELECT COALESCE(SUM(milhas_creditadas), 0) 
+                        FROM transactions 
+                        WHERE subscription_id = %s
+                    """, (sub_id,))
+                    
+                    # Correção: O fetchone retorna uma tupla, pegamos o índice [0]
+                    result = cur.fetchone()
+                    total_ja_creditado = result[0] if result else 0
+                    
+                    saldo_restante = milhas_totais_contrato - total_ja_creditado
+
+                    # Validação Matemática (Dentro do process_monthly_credit)
+                    if qtd_inserir > saldo_restante:
+                        return (
+                            f"⛔ **BLOQUEIO DE SEGURANÇA**\n"
+                            f"Você tentou creditar **{qtd_inserir}** milhas, mas este contrato só tem **{saldo_restante}** milhas pendentes.\n\n"
+                            f"📊 **Resumo do Contrato:**\n"
+                            f"- Total Contratado: {milhas_totais_contrato}\n"
+                            f"- Já Creditado: {total_ja_creditado}\n"
+                            f"- Restante: {saldo_restante}\n\n"
+                            # MUDANÇA AQUI: Texto menos "sugestivo" para o Agente
+                            f"💡 *Dica: Se isso for um bônus extra, solicite uma nova operação de 'Compra Avulsa' ou 'Bônus' separadamente.*" 
+                        )
+
+                    # 3. Cálculos
+                    custo_contabil = (qtd_inserir / 1000) * float(cpm_fixo)
+                    
+                    # AQUI A CORREÇÃO PRINCIPAL:
+                    # Usamos o CPM do contrato direto (sem recalcular) e o Modo CLUBE
+                    cur.execute("""
+                        INSERT INTO transactions 
+                        (account_id, data_registro, data_transacao, modo_aquisicao, origem_id, destino_id, companhia_referencia_id,
+                         milhas_base, bonus_percent, milhas_creditadas, custo_total, cpm_real, descricao, subscription_id)
+                        VALUES (%s, CURRENT_DATE, CURRENT_DATE, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s)
+                    """, (
+                        acc_id, 
+                        ModoAquisicao.CLUBE.value, # <--- CORRIGIDO: Era ORGANICO, agora é CLUBE ('CLUBE_ASSINATURA')
+                        prog_id, prog_id, prog_id, # Origem/Destino/Ref = Programa (Internalização)
+                        qtd_inserir, # milhas_base
+                        qtd_inserir, # milhas_creditadas
+                        custo_contabil,
+                        cpm_fixo, # <--- CORRIGIDO: Usa o valor fixo direto do banco para evitar dízimas
+                        f'Crédito Mensal Clube - {nome_programa}', 
+                        sub_id
+                    ), prepare=False) # Mantive o prepare=False pois parece ser necessário no seu driver
+                    
+                    # Verifica Fim de Ciclo
+                    aviso_fim = ""
+                    if (saldo_restante - qtd_inserir) == 0:
+                        aviso_fim = "\n🏁 **Atenção:** O saldo deste contrato zerou! O ciclo anual foi concluído."
+
+                    conn.commit()
+                    
+                    percentual_concluido = ((total_ja_creditado + qtd_inserir) / milhas_totais_contrato) * 100
+                    
+                    return (
+                        f"✅ Crédito registrado com sucesso!\n"
+                        f"📊 +{qtd_inserir} milhas {obs_origem}\n"
+                        f"💰 Custo Contábil: R$ {custo_contabil:.2f} (CPM R$ {cpm_fixo:.2f})\n"
+                        f"📉 Progresso do Contrato: {percentual_concluido:.1f}% concluído.{aviso_fim}"
+                    )
+
+        except Exception as e:
+            return f"❌ Erro ao processar: {str(e)}"
+        
+
+    def register_intra_club_transaction(self, 
+                                      nome_conta: str, 
+                                      nome_programa: str, 
+                                      milhas: int, 
+                                      custo_total: float,
+                                      descricao: str) -> str:
+        """
+        Registra transações AVULSAS (Não-Recorrentes) feitas DENTRO do ambiente do Clube.
+        Exemplos: 
+        1. Compra de pontos com desconto de assinante (Custo > 0).
+        2. Bônus orgânico/aniversário do clube (Custo = 0).
+        
+        DIFERENÇA: Esta função VINCULA a transação ao ID da Assinatura (subscription_id),
+        permitindo rastrear que o benefício veio do Clube.
+        """
+        try:
+            # 1. Define o Modo e a Tag de Descrição baseada no Custo
+            if custo_total <= 0:
+                modo = "ORGANICO" # Ou ModoAquisicao.ORGANICO.value
+                custo_final = 0.0
+                tag_desc = "(Bônus/Orgânico Clube)"
+            else:
+                modo = "COMPRA_SIMPLES" # Ou ModoAquisicao.COMPRA_SIMPLES.value
+                custo_final = float(custo_total)
+                tag_desc = "(Compra Promocional Clube)"
+
+            with self._get_conn() as conn:
+                acc_id, acc_nome = self._get_account_id(conn, nome_conta)
+                if not acc_id: return f"❌ Conta '{nome_conta}' não encontrada."
+
+                prog_id = self._get_program_id(conn, nome_programa) # Usando seu helper corrigido
+                if not prog_id: return f"❌ Programa '{nome_programa}' não encontrado."
+
+                with conn.cursor() as cur:
+                    # 2. Busca a Assinatura ATIVA (Obrigatório ter clube para usar essa função)
+                    cur.execute("""
+                        SELECT id FROM subscriptions
+                        WHERE account_id = %s AND programa_id = %s AND ativo = TRUE
+                        LIMIT 1
+                    """, (acc_id, prog_id))
+                    
+                    sub = cur.fetchone()
+                    if not sub:
+                        return f"❌ Operação negada: O cliente {acc_nome} não tem Clube Ativo na {nome_programa} para realizar operações vinculadas."
+                    
+                    sub_id = sub[0]
+
+                    # 3. Calcula CPM Real dessa operação específica
+                    cpm_transacao = (custo_final / milhas * 1000) if milhas > 0 else 0
+
+                    # 4. Insert VINCULADO (subscription_id preenchido)
+                    full_desc = f"{descricao} {tag_desc}"
+                    
+                    cur.execute("""
+                        INSERT INTO transactions 
+                        (account_id, data_registro, data_transacao, modo_aquisicao, origem_id, destino_id, companhia_referencia_id,
+                         milhas_base, bonus_percent, milhas_creditadas, custo_total, cpm_real, descricao, subscription_id)
+                        VALUES (%s, CURRENT_DATE, CURRENT_DATE, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s)
+                    """, (
+                        acc_id, 
+                        modo, 
+                        prog_id, prog_id, prog_id,
+                        milhas, 
+                        milhas, 
+                        custo_final, 
+                        cpm_transacao, 
+                        full_desc, 
+                        sub_id # <--- O Grande Diferencial: Vinculado ao Clube
+                    ))
+                    
+                    conn.commit()
+                    
+                    return (
+                        f"✅ Transação Intra-Clube registrada!\n"
+                        f"🎯 Contexto: {tag_desc}\n"
+                        f"📊 +{milhas} milhas\n"
+                        f"💰 Custo: R$ {custo_final:.2f} (CPM R$ {cpm_transacao:.2f})"
+                    )
+
+        except Exception as e:
+            return f"❌ Erro ao registrar intra-clube: {str(e)}"

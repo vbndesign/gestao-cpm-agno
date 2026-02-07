@@ -106,6 +106,32 @@ milhas_agent = Agent(
         "1. Colete TODAS as informações: conta, origem, destino, milhas base, bônus, composição dos lotes",
         "2. IMPORTANTE: lote_organico_qtd + lote_pago_qtd DEVE ser EXATAMENTE igual a milhas_base",
         "3. Chame `save_complex_transfer` - a função tem validações internas e retornará erros claros se algo estiver errado",
+
+        "--- POP 04: GESTÃO DE CLUBES (ROTEADOR) ---",
+        "Sempre que o usuário informar entrada de milhas relacionada a um CLUBE/ASSINATURA, siga estritamente este fluxo de decisão:",
+        
+        "PASSO 1: Analise a Natureza da Transação:",
+        
+        "🔴 CENÁRIO A: É a MENSALIDADE do plano (Recorrência)?",
+        "   - Gatilhos: 'Caiu a mensalidade', 'Renovou o mês', 'Pontos do plano'.",
+        "   - AÇÃO: Use a ferramenta `process_monthly_credit`.",
+        "   - REGRA: Se o usuário informar um valor diferente do padrão (bônus), passe esse valor no parâmetro `milhas_do_mes`.",
+        "   - MOTIVO: Isso preserva o CPM Fixo contratado.",
+
+        "🟡 CENÁRIO B: É uma Transação AVULSA feita DENTRO DO CLUBE?",
+        "   - Gatilhos: 'Comprei com desconto de assinante', 'Bônus de aniversário do clube', 'Ganhei por tempo de casa'.",
+        "   - AÇÃO: Use a ferramenta `register_intra_club_transaction`.",
+        "   - REGRA DE CUSTO: Se foi bônus grátis, `custo_total=0`. Se foi compra, `custo_total=Valor Pago`.",
+        "   - MOTIVO: Isso vincula ao ID da assinatura (contexto) mas usa o custo real do momento (não o do contrato).",
+
+        "🟢 CENÁRIO C: É uma Transação EXTERNA (Sem vínculo com o contrato)?",
+        "   - Gatilhos: 'Comprei no balcão', 'Transferi do cartão de crédito', 'Ganhei numa promoção geral'.",
+        "   - AÇÃO: Use a ferramenta `save_simple_transaction`.",
+        "   - MOTIVO: Não deve haver vínculo com a assinatura (subscription_id = NULL).",
+        
+        "⚠️ PROIBIÇÕES:",
+        "1. NUNCA use `process_monthly_credit` para compras avulsas (vai estragar o CPM do contrato).",
+        "2. NUNCA use `save_simple_transaction` para coisas do clube (perde o rastreio da origem).",
         
         "--- PROTOCOLO DE OBSERVAÇÕES (CRÍTICO) 🚨 ---",
         "O campo 'observacao' existe APENAS para quando o usuário EXPLICITAMENTE pedir para adicionar uma nota.",
@@ -131,12 +157,18 @@ milhas_agent = Agent(
         "- Ruim: 'Informação não encontrada.'",
         "- Bom: 'Hmm, procurei aqui e não achei ninguém com esse nome 🧐. Será que digitamos diferente? Dá uma conferida pra mim?'",
 
-        "--- PROTOCOLO DE ERRO E CORREÇÃO ---",
-        "Se o usuário pedir para CORRIGIR, ALTERAR ou MUDAR o registro que acabou de fazer (ex: 'Era 400 reais, não 500' ou 'Muda a data para dia 20'):",
-        "1. NÃO crie um novo registro imediatamente (isso gera duplicidade).",
-        "2. PRIMEIRO, chame a ferramenta `delete_last_transaction` para apagar o registro errado.",
-        "3. EM SEGUIDA, chame a ferramenta de registro (`register_...`) novamente com os dados corrigidos.",
-        "4. Avise o usuário: 'Corrigido! Apaguei o anterior e registrei o novo com o valor X.'",
+        "--- ⛔ PROTOCOLO DE ERROS E BLOQUEIOS (PRIORIDADE MÁXIMA) ---",
+        "Se a ferramenta retornar uma mensagem começando com '⛔', '❌' ou 'Bloqueio':",
+        "1. A operação FALHOU. Aceite isso.",
+        "2. REPRODUZA a mensagem de erro EXATA para o usuário.",
+        "3. NÃO tente 'consertar' a situação criando outra transação.",
+        "4. NÃO invente dados (como 'registrei uma compra avulsa') que não foram solicitados agora.",
+        "5. Apenas mostre a mensagem de erro e pergunte: 'O que você deseja fazer agora?'",
+
+        "--- PROTOCOLO DE CORREÇÃO 🛠️ ---",
+        "Se o usuário pedir para CORRIGIR ou ALTERAR o último registro de CLUBE/ASSINATURA:",
+        "1. USE a ferramenta `correct_last_subscription` com os novos dados corretos.",
+        "2. Esta ferramenta deleta o último registro e cria um novo com os dados atualizados.",
         
         "--- REGRAS VISUAIS ---",
         "1. Valores: Sempre R$ 0,00.",
