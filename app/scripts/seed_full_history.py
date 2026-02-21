@@ -42,13 +42,13 @@ def seed_full():
         if result and result[0] == 0:
             print("⚠️ Tabela programs vazia. Inserindo programas padrão...")
             progs = [
-                ("Livelo", "BANCO", 28.00), ("Esfera", "BANCO", 28.00),
-                ("LATAM Pass", "CIA_AEREA", 29.50), ("Smiles", "CIA_AEREA", 14.50),
-                ("Azul Fidelidade", "CIA_AEREA", 17.50), ("TAP Miles&Go", "CIA_AEREA", 32.00)
+                ("Livelo", "BANCO"), ("Esfera", "BANCO"),
+                ("LATAM Pass", "CIA_AEREA"), ("Smiles", "CIA_AEREA"),
+                ("Azul Fidelidade", "CIA_AEREA"), ("TAP Miles&Go", "CIA_AEREA")
             ]
             for p in progs:
                 cur.execute(
-                    "INSERT INTO programs (nome, tipo, benchmark_atual) VALUES (%s, %s, %s)", 
+                    "INSERT INTO programs (nome, tipo) VALUES (%s, %s)",
                     p
                 )
         

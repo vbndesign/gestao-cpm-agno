@@ -177,13 +177,13 @@ class DatabaseManager(Toolkit):
         try:
             with self._get_conn() as conn:
                 with conn.cursor() as cur:
-                    cur.execute("SELECT nome, benchmark_atual FROM programs WHERE ativo=TRUE ORDER BY nome")
+                    cur.execute("SELECT nome, tipo FROM programs WHERE ativo=TRUE ORDER BY nome")
                     rows = cur.fetchall()
             
             if not rows:
                 return "Nenhum programa encontrado."
             
-            return "📋 Programas Disponíveis:\n" + "\n".join([f"- {r[0]}: R$ {r[1]:.2f}" for r in rows])
+            return "📋 Programas Disponíveis:\n" + "\n".join([f"- {r[0]} ({r[1]})" for r in rows])
         except Exception as e: return f"Erro ao buscar programas: {str(e)}"
 
     def save_simple_transaction(self, 

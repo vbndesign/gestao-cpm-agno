@@ -11,8 +11,6 @@ agent-ui/
 .venv/
 *.db
 
-app/data/backup_only_public.sql
-
 # MCP config (contains secrets)
 .vscode/mcp.json
 
