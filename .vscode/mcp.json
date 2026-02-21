@@ -1,0 +1,25 @@
+{
+    "inputs": [
+        {
+            "id": "supabase_access_token",
+            "type": "promptString",
+            "description": "Supabase Personal Access Token (Settings → Account → Access Tokens)",
+            "password": true
+        }
+    ],
+    "servers": {
+        "supabase": {
+            "command": "npx",
+            "args": [
+                "-y",
+                "@supabase/mcp-server-supabase@latest",
+                "--read-only",
+                "--project-ref",
+                "mnqurlmwkslbjiobhonx"
+            ],
+            "env": {
+                "SUPABASE_ACCESS_TOKEN": "${input:supabase_access_token}"
+            }
+        }
+    }
+}
