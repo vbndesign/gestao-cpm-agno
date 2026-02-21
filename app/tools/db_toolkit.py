@@ -21,6 +21,7 @@ class DatabaseManager(Toolkit):
         self.register(self.get_dashboard)
         self.register(self.register_subscription)
         self.register(self.correct_last_subscription)
+        self.register(self.delete_last_transaction)
         self.register(self.process_monthly_credit)
         self.register(self.register_intra_club_transaction)
 
@@ -562,7 +563,109 @@ class DatabaseManager(Toolkit):
 
         except Exception as e:
             return f"❌ Erro ao corrigir: {str(e)}"
-        
+
+    def delete_last_transaction(self,
+                               nome_conta: str,
+                               nome_programa: Optional[str] = None,
+                               confirmar: bool = False) -> str:
+        """
+        Desfaz (deleta) a ÚLTIMA transação registrada para uma conta.
+
+        ⚠️ REGRA DE SEGURANÇA: Só é seguro apagar a ÚLTIMA transação.
+        Transações anteriores já influenciaram o CPM das seguintes.
+
+        Fluxo obrigatório em 2 etapas:
+          1. Chame com confirmar=False → mostra o que seria apagado (preview).
+          2. Confirme com o usuário na conversa.
+          3. Só então chame com confirmar=True → executa a deleção.
+
+        Args:
+            nome_conta:    Nome, CPF ou UUID da conta.
+            nome_programa: Filtro opcional por programa. Use quando a conta tem
+                           múltiplas transações recentes e precisa de precisão.
+            confirmar:     False = preview | True = deleta de verdade.
+        """
+        try:
+            with self._get_conn() as conn:
+                acc_id, acc_nome = self._get_account_id(conn, nome_conta)
+                if not acc_id:
+                    return f"❌ Conta '{nome_conta}' não encontrada."
+
+                # Monta a query de busca com filtro opcional de programa
+                with conn.cursor() as cur:
+                    if nome_programa:
+                        prog_id = self._get_program_id(conn, nome_programa)
+                        if not prog_id:
+                            return f"❌ Programa '{nome_programa}' não encontrado."
+                        cur.execute("""
+                            SELECT t.id, p.nome, t.modo_aquisicao,
+                                   t.milhas_base, t.bonus_percent, t.milhas_creditadas,
+                                   t.custo_total, t.cpm_real, t.data_transacao,
+                                   t.descricao, t.subscription_id
+                            FROM transactions t
+                            JOIN programs p ON p.id = t.companhia_referencia_id
+                            WHERE t.account_id = %s AND t.companhia_referencia_id = %s
+                            ORDER BY t.created_at DESC
+                            LIMIT 1
+                        """, (acc_id, prog_id))
+                    else:
+                        cur.execute("""
+                            SELECT t.id, p.nome, t.modo_aquisicao,
+                                   t.milhas_base, t.bonus_percent, t.milhas_creditadas,
+                                   t.custo_total, t.cpm_real, t.data_transacao,
+                                   t.descricao, t.subscription_id
+                            FROM transactions t
+                            JOIN programs p ON p.id = t.companhia_referencia_id
+                            WHERE t.account_id = %s
+                            ORDER BY t.created_at DESC
+                            LIMIT 1
+                        """, (acc_id,))
+
+                    row = cur.fetchone()
+                    if not row:
+                        filtro = f" no programa '{nome_programa}'" if nome_programa else ""
+                        return f"❌ Nenhuma transação encontrada para {acc_nome}{filtro}."
+
+                    tx_id, prog_nome, modo, milhas_base, bonus_pct, milhas_cred, \
+                        custo, cpm, data_tx, descricao, sub_id = row
+
+                    aviso_clube = (
+                        "\n⚠️ *Esta transação pertence a uma assinatura. "
+                        "Deletá-la altera o progresso do contrato.*"
+                    ) if sub_id else ""
+
+                    bonus_info = f" + {int(bonus_pct)}% bônus" if bonus_pct else ""
+                    resumo = (
+                        f"📋 **Última transação de {acc_nome}:**\n"
+                        f"- Programa : {prog_nome}\n"
+                        f"- Modo     : {modo}\n"
+                        f"- Milhas   : {milhas_base:,} base{bonus_info} → {milhas_cred:,} creditadas\n"
+                        f"- Custo    : R$ {custo:.2f} | CPM R$ {cpm:.2f}\n"
+                        f"- Data     : {data_tx.strftime('%d/%m/%Y') if data_tx else 'N/A'}\n"
+                        f"- Descrição: {descricao or '—'}"
+                        f"{aviso_clube}"
+                    )
+
+                    if not confirmar:
+                        return (
+                            f"{resumo}\n\n"
+                            f"❓ Confirma a exclusão? Se sim, chame novamente com `confirmar=True`."
+                        )
+
+                    # ── Deleção efetiva ──────────────────────────────────────
+                    # transaction_batches são removidos automaticamente (ON DELETE CASCADE)
+                    cur.execute("DELETE FROM transactions WHERE id = %s", (tx_id,), prepare=False)
+                    conn.commit()
+
+                    return (
+                        f"🗑️ **Transação deletada com sucesso!**\n"
+                        f"{resumo}\n\n"
+                        f"✅ O registro foi removido. Você pode lançar novamente com os dados corretos."
+                    )
+
+        except Exception as e:
+            return f"❌ Erro ao deletar transação: {str(e)}"
+
     def process_monthly_credit(self, nome_conta: str, nome_programa: str, milhas_do_mes: int = 0) -> str:
         """
         Registra a entrada mensal (Recorrência) com TRAVA DE SEGURANÇA.
