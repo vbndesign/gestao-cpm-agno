@@ -114,7 +114,7 @@ milhas_agent = Agent(
         "Diga algo como: 'Não encontrei o Cliente X. Vamos cadastrar rapidinho antes de lançar os pontos?'",
         "Pergunte APENAS:",
         "1. Nome Completo",
-        "2. CPF (Opcional)",
+        "2. CPF (Obrigatório — 11 dígitos, o banco valida)",
         "3. Tipo de Gestão (PRÓPRIA ou CLIENTE)",
         "REGRA DE OURO: Só pergunte sobre a transação DEPOIS que a ferramenta `create_account` retornar SUCESSO. O histórico da conversa lembrará os dados iniciais.",
 

@@ -17,12 +17,12 @@ class DatabaseManager(Toolkit):
         self.register(self.create_account)       # Renomeada e atualizada
         self.register(self.get_programs)
         self.register(self.save_simple_transaction)
-        # self.register(self.prepare_complex_transfer) # DESABILITADA: Validação prévia (economiza tokens)
         self.register(self.save_complex_transfer)
         self.register(self.get_dashboard)
         self.register(self.register_subscription)
         self.register(self.correct_last_subscription)
         self.register(self.process_monthly_credit)
+        self.register(self.register_intra_club_transaction)
 
     def _get_conn(self):
         """
@@ -48,8 +48,9 @@ class DatabaseManager(Toolkit):
     def _is_valid_cpf(self, cpf: str) -> bool:
         """
         Valida CPF (tamanho, dígitos verificadores e repetição).
+        Espera receber CPF já normalizado (apenas dígitos).
         """
-        cpf_digits = self._normalize_cpf(cpf)
+        cpf_digits = cpf  # já normalizado pelo chamador
         if len(cpf_digits) != 11:
             return False
         if cpf_digits == cpf_digits[0] * 11:
@@ -96,6 +97,7 @@ class DatabaseManager(Toolkit):
                     return row[0], row[1]
             
             # 3. Tenta Nome parcial (Case Insensitive)
+            #    Prefixos como 'conta da/do/de' já foram removidos por _normalize_identifier
             cur.execute("SELECT id, nome FROM accounts WHERE nome ILIKE %s", (f"%{identificador_norm}%",))
             row = cur.fetchone()
             if row:
@@ -115,8 +117,8 @@ class DatabaseManager(Toolkit):
     # --- Ferramentas Públicas (Disponíveis para o Agente) ---
     def check_account_exists(self, nome_conta: str) -> str:
         """
-        Verifica se uma conta existe pelo nome.
-        Retorna o ID e Nome se achar, ou avisa que não encontrou.
+        Verifica se uma conta existe pelo nome, alias, CPF ou UUID.
+        Retorna o ID, Nome e Alias (se houver) se achar, ou avisa que não encontrou.
         Use isso ANTES de registrar transações para nomes desconhecidos.
         """
         try:
@@ -128,11 +130,10 @@ class DatabaseManager(Toolkit):
         except Exception as e:
             return f"Erro na busca: {str(e)}"
 
-    def create_account(self, nome_completo: str, tipo_gestao: str, cpf: Optional[str] = None) -> str:
+    def create_account(self, nome_completo: str, tipo_gestao: str, cpf: str) -> str:
         """
-        Cadastra um novo cliente. 
-        Obrigatório: nome_completo e tipo_gestao ('PROPRIA' ou 'CLIENTE').
-        Opcional: cpf.
+        Cadastra um novo cliente.
+        Obrigatório: nome_completo, tipo_gestao ('PROPRIA' ou 'CLIENTE') e cpf.
         """
         try:
             # Normalização simples para o ENUM
@@ -140,22 +141,24 @@ class DatabaseManager(Toolkit):
             if tipo not in ['PROPRIA', 'CLIENTE']:
                 return "❌ Erro: O tipo de gestão deve ser 'PROPRIA' ou 'CLIENTE'."
 
-            cpf_clean = self._normalize_cpf(cpf) if cpf else None
-            
-            # Validação de CPF apenas se foi fornecido
-            if cpf_clean and not self._is_valid_cpf(cpf_clean):
-                 return "Ops, esse CPF não parece válido. Confere pra mim?"
+            # Normalização do CPF (strip antes para eliminar whitespace puro)
+            cpf_stripped = str(cpf or "").strip()
+            if not cpf_stripped:
+                return "❌ Erro: O CPF é obrigatório para cadastrar uma conta."
+
+            cpf_clean = self._normalize_cpf(cpf_stripped)
+            if not self._is_valid_cpf(cpf_clean):
+                return "❌ Erro: CPF inválido. Confira os dígitos e tente novamente."
 
             with self._get_conn() as conn:
                 with conn.cursor() as cur:
-                    # Verifica duplicidade de CPF (se tiver CPF)
-                    if cpf_clean:
-                        cur.execute("SELECT 1 FROM accounts WHERE regexp_replace(cpf, '\\D', '', 'g') = %s", (cpf_clean,))
-                        if cur.fetchone():
-                            return "❌ Erro: Já existe uma conta com este CPF."
+                    # Verifica duplicidade de CPF
+                    cur.execute("SELECT 1 FROM accounts WHERE regexp_replace(cpf, '\\D', '', 'g') = %s", (cpf_clean,))
+                    if cur.fetchone():
+                        return "❌ Erro: Já existe uma conta com este CPF."
 
                     cur.execute(
-                        "INSERT INTO accounts (nome, tipo_gestao, cpf) VALUES (%s, %s, %s) RETURNING id", 
+                        "INSERT INTO accounts (nome, tipo_gestao, cpf) VALUES (%s, %s, %s) RETURNING id",
                         (nome_completo, tipo, cpf_clean)
                     )
                     result = cur.fetchone()
@@ -163,6 +166,7 @@ class DatabaseManager(Toolkit):
                         return "❌ Erro: Não foi possível criar a conta."
                     account_id = result[0]
                 conn.commit()
+
             return f"✅ Conta criada com sucesso para **{nome_completo}** ({tipo})! ID: {account_id}"
         except Exception as e:
             return f"❌ Erro Técnico ao criar conta: {str(e)}"
@@ -259,86 +263,6 @@ class DatabaseManager(Toolkit):
             
         except Exception as e: 
             return f"❌ Erro ao salvar transação: {str(e)}"
-
-    # ============================================================================
-    # FUNÇÃO DESABILITADA: prepare_complex_transfer
-    # ============================================================================
-    # CONTEXTO:
-    # Esta função foi criada para validar transferências complexas ANTES de salvá-las
-    # no banco de dados. Ela verifica se:
-    # - Todos os parâmetros são válidos (milhas > 0, bônus >= 0, etc.)
-    # - A soma dos lotes (orgânico + pago) é exatamente igual a milhas_base
-    # - Exibe um resumo detalhado dos cálculos financeiros (CPM, custos, etc.)
-    #
-    # MOTIVO DA DESABILITAÇÃO:
-    # - Gasta tokens extras (~5-10k) por validação
-    # - As mesmas validações JÁ EXISTEM em save_complex_transfer
-    # - save_complex_transfer retorna mensagens de erro claras se algo estiver errado
-    # - A validação no nível de banco de dados (constraints/triggers) é planejada
-    #
-    # QUANDO REATIVAR:
-    # - Se houver muitos erros de validação em produção
-    # - Se o agente precisar "pré-visualizar" cálculos complexos antes de salvar
-    # - Para debugging de problemas recorrentes com lotes mistos
-    #
-    # PARA REATIVAR: Descomente o código abaixo e adicione na linha 20:
-    # self.register(self.prepare_complex_transfer)
-    # ============================================================================
-    # def prepare_complex_transfer(self,
-    #                             identificador_conta: str,
-    #                             origem_nome: str,
-    #                             destino_nome: str,
-    #                             milhas_base: int,
-    #                             bonus_percent: float,
-    #                             lote_organico_qtd: int,
-    #                             lote_organico_cpm: float,
-    #                             lote_pago_qtd: int,
-    #                             lote_pago_custo_total: float) -> str:
-    #     """
-    #     FERRAMENTA DE VALIDAÇÃO: Use isso ANTES de save_complex_transfer.
-    #     Valida todos os parâmetros e mostra o resumo do que será salvo.
-    #     Ajuda o agente a confirmar se os cálculos estão corretos.
-    #     """
-    #     # Validações básicas
-    #     errors = []
-    #     if milhas_base <= 0:
-    #         errors.append("❌ milhas_base deve ser maior que zero")
-    #     if bonus_percent < 0:
-    #         errors.append("❌ bonus_percent não pode ser negativo")
-    #     if lote_organico_qtd < 0:
-    #         errors.append("❌ lote_organico_qtd não pode ser negativo")
-    #     if lote_pago_qtd < 0:
-    #         errors.append("❌ lote_pago_qtd não pode ser negativo")
-    #     
-    #     soma_lotes = lote_organico_qtd + lote_pago_qtd
-    #     if soma_lotes != milhas_base:
-    #         errors.append(f"❌ ERRO CRÍTICO: Soma dos lotes ({soma_lotes}) ≠ milhas_base ({milhas_base})")
-    #     
-    #     if errors:
-    #         return "⚠️ PROBLEMAS DETECTADOS:\n" + "\n".join(errors)
-    #     
-    #     # Cálculos (mesma lógica de save_complex_transfer)
-    #     custo_organico = (lote_organico_qtd / 1000) * lote_organico_cpm
-    #     custo_total = custo_organico + lote_pago_custo_total
-    #     milhas_creditadas = int(milhas_base * (1 + bonus_percent / 100))
-    #     cpm_real = (custo_total / milhas_creditadas * 1000) if milhas_creditadas > 0 else 0
-    #     
-    #     return f"""✅ Validação OK! Resumo da Transferência:
-    # 
-    # 📍 **Conta:** {identificador_conta}
-    # 🔄 **Rota:** {origem_nome} → {destino_nome}
-    # 📊 **Composição:**
-    #    • Lote Orgânico: {lote_organico_qtd:,} milhas @ R$ {lote_organico_cpm:.2f}/k = R$ {custo_organico:.2f}
-    #    • Lote Pago: {lote_pago_qtd:,} milhas = R$ {lote_pago_custo_total:.2f}
-    # 
-    # 💰 **Financeiro:**
-    #    • Milhas Base: {milhas_base:,}
-    #    • Bônus: {bonus_percent}%
-    #    • **Milhas Creditadas: {milhas_creditadas:,}**
-    #    • **Custo Total: R$ {custo_total:.2f}**
-    #    • **CPM Final: R$ {cpm_real:.2f}**
-    # 
-    # ✅ Tudo certo! Pode chamar save_complex_transfer com esses mesmos parâmetros."""
 
     def save_complex_transfer(self,
                             identificador_conta: str,
