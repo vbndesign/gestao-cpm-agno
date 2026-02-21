@@ -12,3 +12,10 @@ agent-ui/
 *.db
 
 app/data/backup_only_public.sql
+
+# MCP config (contains secrets)
+.vscode/mcp.json
+
+# MCP runner scripts (machine-specific wrappers, read tokens from .env)
+scripts/run_mcp_*.cmd
+scripts/run_mcp_*.ps1
