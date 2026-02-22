@@ -312,5 +312,5 @@ milhas_agent = Agent(
     ],
     markdown=True,
     add_datetime_to_context=True,
-    debug_mode=True
+    debug_mode=debug_mode
 )

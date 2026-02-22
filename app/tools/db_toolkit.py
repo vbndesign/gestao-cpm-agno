@@ -1,11 +1,41 @@
+import functools
+import logging
 import psycopg
 import re
+import time
 from datetime import date
 from typing import Optional, Tuple
 from agno.tools import Toolkit
 from app.core.database import Database
 from app.core.enums import TipoLote, ModoAquisicao
 from app.tools.date_parser import parse_date_natural
+
+_logger = logging.getLogger("wf_milhas.tools")
+
+
+def log_tool_call(func):
+    """Loga início, duração e outcome de cada tool call. Nunca loga parâmetros (LGPD)."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        _logger.info("tool_start", extra={"event": "tool_start", "tool": func.__name__})
+        t0 = time.perf_counter()
+        try:
+            result = func(*args, **kwargs)
+            _logger.info("tool_ok", extra={
+                "event": "tool_ok",
+                "tool": func.__name__,
+                "duration_ms": int((time.perf_counter() - t0) * 1000),
+            })
+            return result
+        except Exception as e:
+            _logger.error("tool_error", extra={
+                "event": "tool_error",
+                "tool": func.__name__,
+                "error_type": type(e).__name__,
+                "duration_ms": int((time.perf_counter() - t0) * 1000),
+            })
+            raise
+    return wrapper
 
 class DatabaseManager(Toolkit):
     def __init__(self):
@@ -116,6 +146,7 @@ class DatabaseManager(Toolkit):
             return None
 
     # --- Ferramentas Públicas (Disponíveis para o Agente) ---
+    @log_tool_call
     def check_account_exists(self, nome_conta: str) -> str:
         """
         Verifica se uma conta existe pelo nome, alias, CPF ou UUID.
@@ -131,6 +162,7 @@ class DatabaseManager(Toolkit):
         except Exception as e:
             return f"Erro na busca: {str(e)}"
 
+    @log_tool_call
     def create_account(self, nome_completo: str, tipo_gestao: str, cpf: str) -> str:
         """
         Cadastra um novo cliente.
@@ -172,6 +204,7 @@ class DatabaseManager(Toolkit):
         except Exception as e:
             return f"❌ Erro Técnico ao criar conta: {str(e)}"
 
+    @log_tool_call
     def get_programs(self) -> str:
         """Lista todos os programas de fidelidade cadastrados."""
         try:
@@ -186,7 +219,8 @@ class DatabaseManager(Toolkit):
             return "📋 Programas Disponíveis:\n" + "\n".join([f"- {r[0]} ({r[1]})" for r in rows])
         except Exception as e: return f"Erro ao buscar programas: {str(e)}"
 
-    def save_simple_transaction(self, 
+    @log_tool_call
+    def save_simple_transaction(self,
                               nome_conta: str, 
                               nome_programa: str, 
                               milhas: int, 
@@ -265,6 +299,7 @@ class DatabaseManager(Toolkit):
         except Exception as e: 
             return f"❌ Erro ao salvar transação: {str(e)}"
 
+    @log_tool_call
     def save_complex_transfer(self,
                             identificador_conta: str,
                             origem_nome: str,
@@ -364,6 +399,7 @@ class DatabaseManager(Toolkit):
         except Exception as e: 
             return f"❌ Erro na transferência: {type(e).__name__} - {str(e)}"
 
+    @log_tool_call
     def get_dashboard(self, identificador_conta: str) -> str:
         """Consulta saldo consolidado e CPM médio."""
         try:
@@ -400,6 +436,7 @@ class DatabaseManager(Toolkit):
 
         except Exception as e: return f"❌ Erro ao consultar dashboard: {str(e)}"
 
+    @log_tool_call
     def register_subscription(self,
                             nome_conta: str, 
                             nome_programa: str, 
@@ -498,7 +535,8 @@ class DatabaseManager(Toolkit):
             return f"❌ Erro ao registrar assinatura: {str(e)}"
         
 
-    def correct_last_subscription(self, 
+    @log_tool_call
+    def correct_last_subscription(self,
                                 nome_conta: str, 
                                 nome_programa: str, 
                                 valor_total_ciclo: float, 
@@ -564,6 +602,7 @@ class DatabaseManager(Toolkit):
         except Exception as e:
             return f"❌ Erro ao corrigir: {str(e)}"
 
+    @log_tool_call
     def delete_last_transaction(self,
                                nome_conta: str,
                                nome_programa: Optional[str] = None,
@@ -666,6 +705,7 @@ class DatabaseManager(Toolkit):
         except Exception as e:
             return f"❌ Erro ao deletar transação: {str(e)}"
 
+    @log_tool_call
     def process_monthly_credit(self, nome_conta: str, nome_programa: str, milhas_do_mes: int = 0) -> str:
         """
         Registra a entrada mensal (Recorrência) com TRAVA DE SEGURANÇA.
@@ -769,7 +809,8 @@ class DatabaseManager(Toolkit):
             return f"❌ Erro ao processar: {str(e)}"
         
 
-    def register_intra_club_transaction(self, 
+    @log_tool_call
+    def register_intra_club_transaction(self,
                                       nome_conta: str, 
                                       nome_programa: str, 
                                       milhas: int, 

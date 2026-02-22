@@ -1,4 +1,5 @@
 import logging
+import time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
 from slack_sdk import WebClient
@@ -7,10 +8,11 @@ from slack_sdk.signature import SignatureVerifier
 # --- IMPORTS DA ARQUITETURA ---
 from app.config.settings import settings
 from app.core.database import Database
+from app.core.logging_config import setup_logging
 from app.agents.milhas_agent import milhas_agent
 
 # Configuração de Logs via Settings
-logging.basicConfig(level=settings.log_level)
+setup_logging(settings.app_env, settings.log_level)
 logger = logging.getLogger("wf_milhas")
 
 # --- LIFESPAN (Gerenciamento de Vida do App) ---
@@ -51,7 +53,7 @@ async def process_slack_message(event: dict):
     # Limpeza de texto (remove menção <@BOTID>)
     cleaned_text = text.split(">")[-1].strip() if text and "<@" in text else (text or "")
     
-    logger.info(f"🤖 Processando mensagem de {user_id}: {cleaned_text[:50]}...")
+    logger.info("msg_received", extra={"event": "msg_received", "user_id": user_id})
 
     # --- ESTRATÉGIA DE MEMÓRIA E ROTEAMENTO ---
     # Definição de onde responder e qual memória usar
@@ -85,13 +87,20 @@ async def process_slack_message(event: dict):
         except: pass
 
         # 2. Chamada ao Agente
+        _t0 = time.perf_counter()
         response_stream = milhas_agent.run(
-            cleaned_text, 
+            cleaned_text,
             session_id=session_id, # Memória dinâmica
             user_id=user_id,
             stream=False
         )
-        
+        logger.info("agent_run_ok", extra={
+            "event": "agent_run_ok",
+            "session_id": session_id,
+            "context_type": context_type,
+            "duration_ms": int((time.perf_counter() - _t0) * 1000),
+        })
+
         response_text = response_stream.content or "Desculpe, fiquei sem resposta."
 
         # 3. Reação Visual: Check (Sucesso)
@@ -109,7 +118,11 @@ async def process_slack_message(event: dict):
         )
 
     except Exception as e:
-        logger.error(f"❌ Erro crítico: {e}", exc_info=True)
+        logger.error("agent_run_error", extra={
+            "event": "agent_run_error",
+            "session_id": session_id,
+            "error_type": type(e).__name__,
+        }, exc_info=True)
         try:
             slack_client.chat_postMessage(
                 channel=channel_id, 
