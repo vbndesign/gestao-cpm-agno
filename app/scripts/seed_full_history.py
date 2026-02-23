@@ -23,7 +23,7 @@ def clean_db(conn):
     print("🧹 Limpando dados antigos no Supabase...")
     with conn.cursor() as cur:
         # Apagar na ordem inversa das dependências
-        tables = ["transaction_batches", "transactions", "issuances", "cpf_slots", "accounts"]
+        tables = ["transaction_batches", "transactions", "accounts"]
         for t in tables:
             cur.execute(f"TRUNCATE TABLE {t} CASCADE")
     conn.commit()
@@ -127,14 +127,6 @@ def seed_full():
         """, (tx_clube, roberto_id, livelo, livelo, livelo))
         
         cur.execute("INSERT INTO transaction_batches (transaction_id, tipo, milhas_qtd, cpm_origem, custo_parcial) VALUES (%s, 'PAGO', 240000, 20.00, 4800.00)", (tx_clube,))
-
-        # --- 4. EMISSÕES (Apenas tabela, sem lógica no agente ainda) ---
-        print("   -> Gerando Emissões...")
-        
-        cur.execute("""
-            INSERT INTO issuances (account_id, programa_id, data_emissao, passageiro_nome, localizador, milhas_utilizadas, cpm_medio_momento, custo_venda, valor_venda, status)
-            VALUES (%s, %s, CURRENT_DATE - 2, 'Cliente Avulso', 'URG999', 30000, 17.00, 510.00, 900.00, 'EMITIDA')
-        """, (william_id, smiles))
 
     conn.commit()
     conn.close()

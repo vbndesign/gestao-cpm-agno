@@ -1,6 +1,6 @@
 -- ========================================================
 -- SCHEMA POSTGRESQL - WF MILHAS
--- Versão: sincronizado com DEV/PROD em 2026-02-21
+-- Versão: sincronizado com DEV em 2026-02-23
 -- Fonte: gerado a partir do banco DEV via MCP
 --
 -- USO: Este arquivo representa SEMPRE o estado atual do banco.
@@ -9,6 +9,12 @@
 --
 -- Histórico de alterações aplicadas em PROD:
 --   migrations/prod/ → arquivos de referência de cada mudança
+--
+-- Convenção de migrations:
+--   1. Nomear: YYYYMMDD_NNN_descricao.sql  (ex: 20260222_001_add_feature.sql)
+--   2. Cada migration tem um _rollback.sql ao lado com o desfazer equivalente
+--   3. Sempre validar em DEV antes de aplicar em PROD
+--   4. Incluir ao final: INSERT INTO schema_migrations ... ON CONFLICT DO NOTHING
 -- ========================================================
 
 SET timezone = 'America/Sao_Paulo';
@@ -59,18 +65,7 @@ CREATE TABLE IF NOT EXISTS programs (
     updated_at TIMESTAMPTZ DEFAULT (NOW() AT TIME ZONE 'America/Sao_Paulo')
 );
 
--- 3. cpf_slots
-CREATE TABLE IF NOT EXISTS cpf_slots (
-    id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-    account_id  UUID        NOT NULL REFERENCES accounts(id),
-    programa_id UUID        NOT NULL REFERENCES programs(id),
-    slots_totais INTEGER    DEFAULT 25,
-    slots_usados INTEGER    DEFAULT 0,
-    data_reset  DATE,
-    updated_at  TIMESTAMPTZ DEFAULT (NOW() AT TIME ZONE 'America/Sao_Paulo')
-);
-
--- 4. subscriptions (clubes/recorrência)
+-- 3. subscriptions (clubes/recorrência)
 CREATE TABLE IF NOT EXISTS subscriptions (
     id                      UUID           PRIMARY KEY DEFAULT gen_random_uuid(),
     account_id              UUID           NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -122,7 +117,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     updated_at             TIMESTAMPTZ    DEFAULT (NOW() AT TIME ZONE 'America/Sao_Paulo')
 );
 
--- 6. transaction_batches
+-- 5. transaction_batches
 CREATE TABLE IF NOT EXISTS transaction_batches (
     id             UUID           PRIMARY KEY DEFAULT gen_random_uuid(),
     transaction_id UUID           NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
@@ -133,38 +128,16 @@ CREATE TABLE IF NOT EXISTS transaction_batches (
     ordem          INTEGER        DEFAULT 1
 );
 
--- 7. balances (cache de saldo por conta/programa)
-CREATE TABLE IF NOT EXISTS balances (
-    account_id          UUID           NOT NULL REFERENCES accounts(id),
-    programa_id         UUID           NOT NULL REFERENCES programs(id),
-    milhas_disponiveis  INTEGER        DEFAULT 0,
-    custo_total_estoque NUMERIC(15, 2) DEFAULT 0.00,
-    cpm_medio           NUMERIC(15, 2) DEFAULT 0.00,
-    updated_at          TIMESTAMPTZ    DEFAULT (NOW() AT TIME ZONE 'America/Sao_Paulo'),
-    PRIMARY KEY (account_id, programa_id)
-);
+-- --------------------------------------------------------
+-- RASTREAMENTO DE MIGRATIONS
+-- --------------------------------------------------------
 
--- 8. issuances (emissões de passagens)
-CREATE TABLE IF NOT EXISTS issuances (
-    id                UUID           PRIMARY KEY DEFAULT gen_random_uuid(),
-    account_id        UUID           NOT NULL REFERENCES accounts(id),
-    programa_id       UUID           NOT NULL REFERENCES programs(id),
-    data_emissao      DATE           DEFAULT CURRENT_DATE,
-    passageiro_nome   TEXT           NOT NULL,
-    passageiro_cpf    TEXT,
-    localizador       TEXT,
-    milhas_utilizadas INTEGER        NOT NULL,
-    cpm_medio_momento NUMERIC(15, 2) NOT NULL,
-    custo_venda       NUMERIC(15, 2) NOT NULL,
-    valor_venda       NUMERIC(15, 2) NOT NULL,
-    lucro_bruto NUMERIC(15, 2) GENERATED ALWAYS AS (valor_venda - custo_venda) STORED,
-    margem_percent NUMERIC(5, 2) GENERATED ALWAYS AS (
-        CASE WHEN valor_venda > 0 THEN (valor_venda - custo_venda) / valor_venda * 100 ELSE 0 END
-    ) STORED,
-    status     TEXT        CHECK (status IN ('EMITIDA', 'VOADA', 'CANCELADA')) DEFAULT 'EMITIDA',
-    created_at TIMESTAMPTZ DEFAULT (NOW() AT TIME ZONE 'America/Sao_Paulo'),
-    updated_at TIMESTAMPTZ DEFAULT (NOW() AT TIME ZONE 'America/Sao_Paulo')
+CREATE TABLE IF NOT EXISTS public.schema_migrations (
+    version     TEXT        PRIMARY KEY,
+    applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    description TEXT
 );
+ALTER TABLE public.schema_migrations ENABLE ROW LEVEL SECURITY;
 
 -- --------------------------------------------------------
 -- TRIGGERS
@@ -172,10 +145,6 @@ CREATE TABLE IF NOT EXISTS issuances (
 
 CREATE TRIGGER update_transactions_modtime
     BEFORE UPDATE ON transactions
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
-CREATE TRIGGER update_issuances_modtime
-    BEFORE UPDATE ON issuances
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- Desativa subscription automaticamente quando data_fim é preenchida
@@ -193,14 +162,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS accounts_cpf_key ON accounts(cpf);
 -- programs
 CREATE UNIQUE INDEX IF NOT EXISTS programs_nome_key ON programs(nome);
 
--- cpf_slots
-CREATE INDEX IF NOT EXISTS idx_cpf_slots_account_id  ON cpf_slots(account_id);
-CREATE INDEX IF NOT EXISTS idx_cpf_slots_programa_id ON cpf_slots(programa_id);
-
 -- subscriptions
 CREATE INDEX IF NOT EXISTS idx_subs_account          ON subscriptions(account_id);
 CREATE INDEX IF NOT EXISTS idx_subs_programa         ON subscriptions(programa_id);
 CREATE INDEX IF NOT EXISTS idx_subs_renovacao        ON subscriptions(data_renovacao);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_subs_unique_active ON subscriptions (account_id, programa_id) WHERE ativo = TRUE;
 
 -- transactions
 CREATE INDEX IF NOT EXISTS idx_transactions_account_id             ON transactions(account_id);
@@ -212,25 +178,15 @@ CREATE INDEX IF NOT EXISTS idx_transactions_subscription_id        ON transactio
 -- transaction_batches
 CREATE INDEX IF NOT EXISTS idx_transaction_batches_transaction_id ON transaction_batches(transaction_id);
 
--- balances
-CREATE INDEX IF NOT EXISTS idx_balances_programa_id ON balances(programa_id);
-
--- issuances
-CREATE INDEX IF NOT EXISTS idx_issuances_account_id  ON issuances(account_id);
-CREATE INDEX IF NOT EXISTS idx_issuances_programa_id ON issuances(programa_id);
-
 -- --------------------------------------------------------
 -- RLS (Row Level Security)
 -- --------------------------------------------------------
 
-ALTER TABLE accounts           ENABLE ROW LEVEL SECURITY;
-ALTER TABLE programs           ENABLE ROW LEVEL SECURITY;
-ALTER TABLE cpf_slots          ENABLE ROW LEVEL SECURITY;
-ALTER TABLE subscriptions      ENABLE ROW LEVEL SECURITY;
-ALTER TABLE transactions       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE accounts            ENABLE ROW LEVEL SECURITY;
+ALTER TABLE programs            ENABLE ROW LEVEL SECURITY;
+ALTER TABLE subscriptions       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE transactions        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE transaction_batches ENABLE ROW LEVEL SECURITY;
-ALTER TABLE balances           ENABLE ROW LEVEL SECURITY;
-ALTER TABLE issuances          ENABLE ROW LEVEL SECURITY;
 
 -- --------------------------------------------------------
 -- COMENTÁRIOS

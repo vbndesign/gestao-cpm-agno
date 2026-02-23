@@ -1,11 +1,54 @@
+import functools
+import logging
 import psycopg
 import re
+import time
+import uuid
 from datetime import date
 from typing import Optional, Tuple
 from agno.tools import Toolkit
 from app.core.database import Database
 from app.core.enums import TipoLote, ModoAquisicao
 from app.tools.date_parser import parse_date_natural
+
+_logger = logging.getLogger("wf_milhas.tools")
+
+
+def _sanitize_error(tool_name: str, e: Exception) -> str:
+    """Loga a exceção real e retorna mensagem genérica com ref rastreável ao agente (segurança)."""
+    ref = uuid.uuid4().hex[:8]
+    _logger.error("tool_exception", extra={
+        "event": "tool_exception",
+        "tool": tool_name,
+        "error_type": type(e).__name__,
+        "ref": ref,
+    }, exc_info=True)
+    return f"❌ Erro interno ao executar '{tool_name}' [ref: {ref}]. Operação não concluída."
+
+
+def log_tool_call(func):
+    """Loga início, duração e outcome de cada tool call. Nunca loga parâmetros (LGPD)."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        _logger.info("tool_start", extra={"event": "tool_start", "tool": func.__name__})
+        t0 = time.perf_counter()
+        try:
+            result = func(*args, **kwargs)
+            _logger.info("tool_ok", extra={
+                "event": "tool_ok",
+                "tool": func.__name__,
+                "duration_ms": int((time.perf_counter() - t0) * 1000),
+            })
+            return result
+        except Exception as e:
+            _logger.error("tool_error", extra={
+                "event": "tool_error",
+                "tool": func.__name__,
+                "error_type": type(e).__name__,
+                "duration_ms": int((time.perf_counter() - t0) * 1000),
+            })
+            raise
+    return wrapper
 
 class DatabaseManager(Toolkit):
     def __init__(self):
@@ -22,6 +65,7 @@ class DatabaseManager(Toolkit):
         self.register(self.register_subscription)
         self.register(self.correct_last_subscription)
         self.register(self.delete_last_transaction)
+        self.register(self.confirm_delete_transaction)
         self.register(self.process_monthly_credit)
         self.register(self.register_intra_club_transaction)
 
@@ -115,7 +159,92 @@ class DatabaseManager(Toolkit):
             if row: return row[0]
             return None
 
+    def _parse_subscription_params(
+        self,
+        valor_total_ciclo: float,
+        milhas_garantidas_ciclo: int,
+        data_renovacao: str,
+        data_inicio: Optional[str],
+        is_mensal: bool,
+    ) -> Tuple[Optional[str], Optional[float], Optional[int], Optional[date], Optional[date], Optional[str]]:
+        """
+        Valida e normaliza os parâmetros de uma assinatura antes de qualquer acesso ao banco.
+        Retorna (error, valor_contrato, milhas_contrato, dt_inicio, data_renov_dt, tipo_contrato).
+        Se error não for None, todos os demais campos são None e o chamador deve retornar o erro.
+        """
+        if data_inicio:
+            dt_inicio = parse_date_natural(data_inicio, prefer_future=False)
+            if not dt_inicio:
+                return (
+                    f"❌ Erro: Não consegui interpretar a data de início '{data_inicio}'. "
+                    "Use formatos como 'DD/MM/AAAA' ou 'DD de mês de AAAA'.",
+                    None, None, None, None, None,
+                )
+        else:
+            dt_inicio = date.today()
+
+        data_renov_dt = parse_date_natural(data_renovacao, prefer_future=True)
+        if not data_renov_dt:
+            return (
+                f"❌ Erro: Não consegui interpretar a data de renovação '{data_renovacao}'. "
+                "Use formatos como 'daqui a 1 ano', 'DD/MM/AAAA' ou 'DD de mês de AAAA'.",
+                None, None, None, None, None,
+            )
+
+        if data_renov_dt <= dt_inicio:
+            return (
+                f"❌ Erro: A data de renovação deve ser posterior à data de início. "
+                f"Início: {dt_inicio.strftime('%d/%m/%Y')}, Renovação: {data_renov_dt.strftime('%d/%m/%Y')}.",
+                None, None, None, None, None,
+            )
+
+        if is_mensal:
+            valor_contrato = float(valor_total_ciclo) * 12
+            milhas_contrato = int(milhas_garantidas_ciclo) * 12
+            tipo_contrato = "MENSAL (Anualizado x12)"
+        else:
+            valor_contrato = float(valor_total_ciclo)
+            milhas_contrato = int(milhas_garantidas_ciclo)
+            tipo_contrato = "ANUAL (Valor Cheio)"
+
+        if valor_contrato <= 0:
+            return ("❌ Erro: valor_total_ciclo deve ser maior que zero.", None, None, None, None, None)
+        if milhas_contrato <= 0:
+            return ("❌ Erro: milhas_garantidas_ciclo deve ser maior que zero.", None, None, None, None, None)
+
+        return (None, valor_contrato, milhas_contrato, dt_inicio, data_renov_dt, tipo_contrato)
+
+    def _insert_subscription(
+        self,
+        conn: psycopg.Connection,
+        acc_id: str,
+        prog_id: str,
+        valor_contrato: float,
+        milhas_contrato: int,
+        dt_inicio: date,
+        data_renov_dt: date,
+    ) -> Optional[Tuple[str, float]]:
+        """
+        Executa o INSERT na tabela subscriptions usando a conexão fornecida.
+        Não faz commit — responsabilidade do chamador.
+        Retorna (new_sub_id, cpm_fixo) calculado pelo banco, ou None se o RETURNING não retornar linha.
+        """
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO subscriptions
+                (account_id, programa_id, valor_total_ciclo, milhas_garantidas_ciclo,
+                 data_inicio, data_renovacao, ativo)
+                VALUES (%s, %s, %s, %s, %s, %s, TRUE)
+                RETURNING id, cpm_fixo
+            """, (acc_id, prog_id, valor_contrato, milhas_contrato, dt_inicio, data_renov_dt),
+            prepare=False)
+            result = cur.fetchone()
+            if not result:
+                return None
+            return (str(result[0]), result[1])
+
     # --- Ferramentas Públicas (Disponíveis para o Agente) ---
+    @log_tool_call
     def check_account_exists(self, nome_conta: str) -> str:
         """
         Verifica se uma conta existe pelo nome, alias, CPF ou UUID.
@@ -129,8 +258,9 @@ class DatabaseManager(Toolkit):
                     return f"✅ Conta encontrada: {acc_nome} (ID: {acc_id})"
                 return "❌ Conta não encontrada. Verifique o nome ou inicie o cadastro."
         except Exception as e:
-            return f"Erro na busca: {str(e)}"
+            return _sanitize_error("check_account_exists", e)
 
+    @log_tool_call
     def create_account(self, nome_completo: str, tipo_gestao: str, cpf: str) -> str:
         """
         Cadastra um novo cliente.
@@ -170,8 +300,9 @@ class DatabaseManager(Toolkit):
 
             return f"✅ Conta criada com sucesso para **{nome_completo}** ({tipo})! ID: {account_id}"
         except Exception as e:
-            return f"❌ Erro Técnico ao criar conta: {str(e)}"
+            return _sanitize_error("create_account", e)
 
+    @log_tool_call
     def get_programs(self) -> str:
         """Lista todos os programas de fidelidade cadastrados."""
         try:
@@ -184,9 +315,11 @@ class DatabaseManager(Toolkit):
                 return "Nenhum programa encontrado."
             
             return "📋 Programas Disponíveis:\n" + "\n".join([f"- {r[0]} ({r[1]})" for r in rows])
-        except Exception as e: return f"Erro ao buscar programas: {str(e)}"
+        except Exception as e:
+            return _sanitize_error("get_programs", e)
 
-    def save_simple_transaction(self, 
+    @log_tool_call
+    def save_simple_transaction(self,
                               nome_conta: str, 
                               nome_programa: str, 
                               milhas: int, 
@@ -262,9 +395,10 @@ class DatabaseManager(Toolkit):
                         f"💰 **CPM Final:** R$ {cpm_real:.2f}"
                     )
             
-        except Exception as e: 
-            return f"❌ Erro ao salvar transação: {str(e)}"
+        except Exception as e:
+            return _sanitize_error("save_simple_transaction", e)
 
+    @log_tool_call
     def save_complex_transfer(self,
                             identificador_conta: str,
                             origem_nome: str,
@@ -359,11 +493,10 @@ class DatabaseManager(Toolkit):
 
                 conn.commit()
                 return f"✅ Transferência Salva para {acc_nome}! CPM Final: **R$ {cpm_real:.2f}**"
-        except psycopg.Error as db_err:
-            return f"❌ Erro de Banco de Dados: {type(db_err).__name__} - {str(db_err)}"
-        except Exception as e: 
-            return f"❌ Erro na transferência: {type(e).__name__} - {str(e)}"
+        except Exception as e:
+            return _sanitize_error("save_complex_transfer", e)
 
+    @log_tool_call
     def get_dashboard(self, identificador_conta: str) -> str:
         """Consulta saldo consolidado e CPM médio."""
         try:
@@ -398,8 +531,10 @@ class DatabaseManager(Toolkit):
             res += f"\n**Total Geral:** {total_milhas:,.0f} milhas"
             return res
 
-        except Exception as e: return f"❌ Erro ao consultar dashboard: {str(e)}"
+        except Exception as e:
+            return _sanitize_error("get_dashboard", e)
 
+    @log_tool_call
     def register_subscription(self,
                             nome_conta: str, 
                             nome_programa: str, 
@@ -424,63 +559,33 @@ class DatabaseManager(Toolkit):
                 Use False quando o usuário informar valores anuais/totais.
         """
         try:
-            # Parse e validação de data de início
-            if data_inicio:
-                dt_inicio = parse_date_natural(data_inicio, prefer_future=False)
-                if not dt_inicio:
-                    return f"❌ Erro: Não consegui interpretar a data de início '{data_inicio}'. Use formatos como 'DD/MM/AAAA' ou 'DD de mês de AAAA'."
-            else:
-                dt_inicio = date.today()
-            
-            # Parse e validação de data de renovação (com preferência por futuro)
-            data_renov_dt = parse_date_natural(data_renovacao, prefer_future=True)
-            if not data_renov_dt:
-                return f"❌ Erro: Não consegui interpretar a data de renovação '{data_renovacao}'. Use formatos como 'daqui a 1 ano', 'DD/MM/AAAA' ou 'DD de mês de AAAA'."
-            
-            if data_renov_dt <= dt_inicio:
-                return f"❌ Erro: A data de renovação deve ser posterior à data de início. Início: {dt_inicio.strftime('%d/%m/%Y')}, Renovação: {data_renov_dt.strftime('%d/%m/%Y')}."
-
-            # Lógica de Anualização (Cálculo seguro no Python)
-            if is_mensal:
-                valor_contrato = float(valor_total_ciclo) * 12
-                milhas_contrato = int(milhas_garantidas_ciclo) * 12
-                tipo_contrato = "MENSAL (Anualizado x12)"
-            else:
-                valor_contrato = float(valor_total_ciclo)
-                milhas_contrato = int(milhas_garantidas_ciclo)
-                tipo_contrato = "ANUAL (Valor Cheio)"
-
-            # Validações de entrada
-            if valor_contrato <= 0:
-                return "❌ Erro: valor_total_ciclo deve ser maior que zero."
-            if milhas_contrato <= 0:
-                return "❌ Erro: milhas_garantidas_ciclo deve ser maior que zero."
+            err, valor_contrato, milhas_contrato, dt_inicio, data_renov_dt, tipo_contrato = \
+                self._parse_subscription_params(
+                    valor_total_ciclo, milhas_garantidas_ciclo,
+                    data_renovacao, data_inicio, is_mensal,
+                )
+            if err:
+                return err
+            assert valor_contrato is not None and milhas_contrato is not None
+            assert dt_inicio is not None and data_renov_dt is not None and tipo_contrato is not None
 
             with self._get_conn() as conn:
                 acc_id, acc_nome = self._get_account_id(conn, nome_conta)
-                if not acc_id: 
+                if not acc_id:
                     return f"❌ Conta '{nome_conta}' não encontrada."
-                
+
                 prog_id = self._get_program_id(conn, nome_programa)
-                if not prog_id: 
+                if not prog_id:
                     return f"❌ Programa '{nome_programa}' não encontrado."
-                
-                with conn.cursor() as cur:
-                    # Inserção com retorno do CPM calculado (usando valores do contrato)
-                    # Nota: data_fim é deixada NULL (assinatura ativa). Será preenchida apenas quando o contrato encerrar.
-                    cur.execute("""
-                        INSERT INTO subscriptions 
-                        (account_id, programa_id, valor_total_ciclo, milhas_garantidas_ciclo, data_inicio, data_renovacao, ativo)
-                        VALUES (%s, %s, %s, %s, %s, %s, TRUE)
-                        RETURNING cpm_fixo
-                    """, (acc_id, prog_id, valor_contrato, milhas_contrato, dt_inicio, data_renov_dt),
-                         prepare=False)
-                    
-                    result = cur.fetchone()
-                    if not result:
-                        return "❌ Erro: Não foi possível criar a assinatura."
-                    cpm_calculado = result[0]
-                
+
+                insert_result = self._insert_subscription(
+                    conn, acc_id, prog_id,
+                    valor_contrato, milhas_contrato, dt_inicio, data_renov_dt,
+                )
+                if insert_result is None:
+                    return "❌ Erro: Não foi possível criar a assinatura."
+                _, cpm_calculado = insert_result
+
                 conn.commit()
                 return (
                     f"✅ **Assinatura Criada com Sucesso!**\n"
@@ -489,16 +594,17 @@ class DatabaseManager(Toolkit):
                     f"💰 **Valor Global:** R$ {valor_contrato:.2f}\n"
                     f"📉 **CPM Travado:** R$ {cpm_calculado:.2f}\n"
                     f"� **Início:** {dt_inicio.strftime('%d/%m/%Y')}\n"
-                    f"�🔄 **Renovação:** {data_renov_dt.strftime('%d/%m/%Y')}\n"                    
-                    f"✅ **Status:** Ativo\n"                    
+                    f"�🔄 **Renovação:** {data_renov_dt.strftime('%d/%m/%Y')}\n"
+                    f"✅ **Status:** Ativo\n"
                     f"ℹ️ *Nota: O sistema baixará 1/12 desse saldo a cada mensalidade.*"
                 )
-                
+
         except Exception as e:
-            return f"❌ Erro ao registrar assinatura: {str(e)}"
+            return _sanitize_error("register_subscription", e)
         
 
-    def correct_last_subscription(self, 
+    @log_tool_call
+    def correct_last_subscription(self,
                                 nome_conta: str, 
                                 nome_programa: str, 
                                 valor_total_ciclo: float, 
@@ -507,10 +613,16 @@ class DatabaseManager(Toolkit):
                                 data_inicio: Optional[str] = None,
                                 is_mensal: bool = False) -> str:
         """
-        CORREÇÃO: Apaga a última assinatura registrada para esta conta e insere a nova com os dados corrigidos.
+        CORREÇÃO: Desativa a assinatura ativa mais recente do programa informado e cria uma nova
+        com os dados corrigidos. As transações vinculadas são re-linkadas ao novo contrato,
+        preservando o histórico e a trava de segurança de créditos mensais.
         Use ISSO quando o usuário disser 'Errei o valor', 'Corrige a data', etc.
-        
+
+        IMPORTANTE: nome_programa é obrigatório — confirme com o usuário qual clube
+        precisa ser corrigido antes de chamar esta ferramenta.
+
         Args:
+            nome_programa: Nome do programa/clube a corrigir. SEMPRE confirmar com o usuário.
             valor_total_ciclo: Valor monetário do ciclo (mensal ou anual, dependendo de is_mensal).
             milhas_garantidas_ciclo: Quantidade de milhas do ciclo (mensal ou anual).
             data_renovacao: Data de renovação FUTURA. Aceita linguagem natural.
@@ -518,72 +630,104 @@ class DatabaseManager(Toolkit):
             is_mensal: Se True, multiplica os valores por 12 para criar o contrato anual.
         """
         try:
-            # 1. Tratamento da Data (Reutilizando sua função auxiliar)
-            # Precisamos importar parse_date_natural ou tê-la disponível aqui
-            # data_renov_dt = parse_date_natural(data_renovacao) ... (se não tiver a validação aqui, o register vai fazer)
+            # 1. Valida e normaliza parâmetros antes de abrir conexão (fail-fast)
+            err, valor_contrato, milhas_contrato, dt_inicio, data_renov_dt, tipo_contrato = \
+                self._parse_subscription_params(
+                    valor_total_ciclo, milhas_garantidas_ciclo,
+                    data_renovacao, data_inicio, is_mensal,
+                )
+            if err:
+                return err
+            assert valor_contrato is not None and milhas_contrato is not None
+            assert dt_inicio is not None and data_renov_dt is not None and tipo_contrato is not None
 
+            # 2. UMA conexão, UMA transação — tudo atômico
             with self._get_conn() as conn:
-                # --- AQUI ESTÁ A LÓGICA DO NOME ---
-                # Usamos o nome para descobrir o ID
                 acc_id, acc_nome = self._get_account_id(conn, nome_conta)
-                if not acc_id: return f"❌ Conta '{nome_conta}' não encontrada."
+                if not acc_id:
+                    return f"❌ Conta '{nome_conta}' não encontrada."
 
+                prog_id = self._get_program_id(conn, nome_programa)
+                if not prog_id:
+                    return f"❌ Programa '{nome_programa}' não encontrado."
+
+                # 3. Desativa a assinatura ativa mais recente do programa (sem deletar)
+                #    O trigger trg_maintain_consistency seta ativo=FALSE automaticamente ao preencher data_fim
                 with conn.cursor() as cur:
-                    # 2. DELETA A ÚLTIMA ASSINATURA (Limpeza)
-                    # Busca a última criada baseada no timestamp para aquele ID
                     cur.execute("""
-                        DELETE FROM subscriptions 
+                        UPDATE subscriptions
+                        SET data_fim = CURRENT_DATE
                         WHERE id = (
-                            SELECT id FROM subscriptions 
-                            WHERE account_id = %s 
-                            ORDER BY created_at DESC 
+                            SELECT id FROM subscriptions
+                            WHERE account_id = %s AND programa_id = %s AND ativo = TRUE
+                            ORDER BY created_at DESC
                             LIMIT 1
                         )
                         RETURNING id;
-                    """, (acc_id,))
-                    
-                    deleted = cur.fetchone()
-                    msg_delecao = "(Anterior apagada 🗑️)" if deleted else "(Nenhuma anterior encontrada para apagar)"
-                
-                conn.commit() # Confirma a exclusão antes de tentar inserir a nova
-            
-            # 3. CHAMA A FUNÇÃO DE REGISTRO NORMAL
-            # Agora chamamos a função 'irmã' para recriar o registro limpo
-            resultado_novo = self.register_subscription(
-                nome_conta, 
-                nome_programa, 
-                valor_total_ciclo, 
-                milhas_garantidas_ciclo, 
-                data_renovacao,
-                data_inicio,
-                is_mensal
+                    """, (acc_id, prog_id), prepare=False)
+                    row = cur.fetchone()
+                old_sub_id = str(row[0]) if row else None
+
+                msg_anterior = (
+                    "(Anterior desativada — histórico preservado)"
+                    if old_sub_id else
+                    "(Nenhuma ativa encontrada — criando nova)"
+                )
+
+                # 4. Cria nova assinatura corrigida na mesma conexão
+                insert_result = self._insert_subscription(
+                    conn, acc_id, prog_id,
+                    valor_contrato, milhas_contrato, dt_inicio, data_renov_dt,
+                )
+                if insert_result is None:
+                    return "❌ Erro: Não foi possível criar a nova assinatura. A correção foi cancelada."
+                new_sub_id, cpm_calculado = insert_result
+
+                # 5. Re-vincula transações anteriores ao novo subscription_id
+                #    Mantém a trava de segurança de process_monthly_credit funcionando
+                if old_sub_id:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            UPDATE transactions
+                            SET subscription_id = %s
+                            WHERE subscription_id = %s
+                        """, (new_sub_id, old_sub_id), prepare=False)
+
+                # 6. Único commit — desativação + inserção + re-vínculo sobem juntos
+                conn.commit()
+
+            return (
+                f"✅ **Assinatura Corrigida com Sucesso!** {msg_anterior}\n"
+                f"📋 **Tipo:** {tipo_contrato}\n"
+                f"📊 **Contrato Anual:** {milhas_contrato:,} milhas\n"
+                f"💰 **Valor Global:** R$ {valor_contrato:.2f}\n"
+                f"📉 **CPM Travado:** R$ {cpm_calculado:.2f}\n"
+                f"📅 **Início:** {dt_inicio.strftime('%d/%m/%Y')}\n"
+                f"🔄 **Renovação:** {data_renov_dt.strftime('%d/%m/%Y')}\n"
+                f"✅ **Status:** Ativo"
             )
-            
-            return f"{resultado_novo} {msg_delecao}"
 
         except Exception as e:
-            return f"❌ Erro ao corrigir: {str(e)}"
+            return _sanitize_error("correct_last_subscription", e)
 
+    @log_tool_call
     def delete_last_transaction(self,
                                nome_conta: str,
-                               nome_programa: Optional[str] = None,
-                               confirmar: bool = False) -> str:
+                               nome_programa: Optional[str] = None) -> str:
         """
-        Desfaz (deleta) a ÚLTIMA transação registrada para uma conta.
+        Etapa 1/2: Exibe a última transação da conta para revisão antes de deletar.
 
         ⚠️ REGRA DE SEGURANÇA: Só é seguro apagar a ÚLTIMA transação.
         Transações anteriores já influenciaram o CPM das seguintes.
 
-        Fluxo obrigatório em 2 etapas:
-          1. Chame com confirmar=False → mostra o que seria apagado (preview).
-          2. Confirme com o usuário na conversa.
-          3. Só então chame com confirmar=True → executa a deleção.
+        Retorna um resumo da transação com o transaction_id necessário para
+        confirmar a deleção via confirm_delete_transaction(transaction_id=...).
+        Mostre o resumo ao usuário e aguarde confirmação explícita antes de prosseguir.
 
         Args:
             nome_conta:    Nome, CPF ou UUID da conta.
             nome_programa: Filtro opcional por programa. Use quando a conta tem
                            múltiplas transações recentes e precisa de precisão.
-            confirmar:     False = preview | True = deleta de verdade.
         """
         try:
             with self._get_conn() as conn:
@@ -646,26 +790,51 @@ class DatabaseManager(Toolkit):
                         f"{aviso_clube}"
                     )
 
-                    if not confirmar:
-                        return (
-                            f"{resumo}\n\n"
-                            f"❓ Confirma a exclusão? Se sim, chame novamente com `confirmar=True`."
-                        )
-
-                    # ── Deleção efetiva ──────────────────────────────────────
-                    # transaction_batches são removidos automaticamente (ON DELETE CASCADE)
-                    cur.execute("DELETE FROM transactions WHERE id = %s", (tx_id,), prepare=False)
-                    conn.commit()
-
                     return (
-                        f"🗑️ **Transação deletada com sucesso!**\n"
                         f"{resumo}\n\n"
-                        f"✅ O registro foi removido. Você pode lançar novamente com os dados corretos."
+                        f"❓ Confirma a exclusão? Se sim, chame `confirm_delete_transaction`"
+                        f" com `transaction_id='{tx_id}'`."
                     )
 
         except Exception as e:
-            return f"❌ Erro ao deletar transação: {str(e)}"
+            return _sanitize_error("delete_last_transaction", e)
 
+    @log_tool_call
+    def confirm_delete_transaction(self, transaction_id: str) -> str:
+        """
+        Etapa 2/2: Executa a deleção de uma transação previamente exibida em preview.
+        Requer o transaction_id retornado por delete_last_transaction().
+
+        ⚠️ Só chame após mostrar o preview ao usuário e obter confirmação explícita.
+        transaction_batches vinculados são removidos automaticamente (ON DELETE CASCADE).
+        """
+        try:
+            with self._get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT t.id, p.nome, t.milhas_creditadas, t.custo_total, t.data_transacao
+                        FROM transactions t
+                        JOIN programs p ON p.id = t.companhia_referencia_id
+                        WHERE t.id = %s
+                    """, (transaction_id,))
+                    row = cur.fetchone()
+                    if not row:
+                        return "❌ Transação não encontrada. Verifique o ID ou execute o preview novamente."
+
+                    tx_id, prog_nome, milhas, custo, data_tx = row
+                    cur.execute("DELETE FROM transactions WHERE id = %s", (tx_id,), prepare=False)
+                conn.commit()
+
+            data_fmt = data_tx.strftime('%d/%m/%Y') if data_tx else 'N/A'
+            return (
+                f"🗑️ **Transação deletada com sucesso!**\n"
+                f"- Programa: {prog_nome} | {milhas:,} milhas | R$ {custo:.2f} | {data_fmt}\n\n"
+                f"✅ O registro foi removido. Você pode lançar novamente com os dados corretos."
+            )
+        except Exception as e:
+            return _sanitize_error("confirm_delete_transaction", e)
+
+    @log_tool_call
     def process_monthly_credit(self, nome_conta: str, nome_programa: str, milhas_do_mes: int = 0) -> str:
         """
         Registra a entrada mensal (Recorrência) com TRAVA DE SEGURANÇA.
@@ -680,12 +849,17 @@ class DatabaseManager(Toolkit):
                 if not prog_id: return f"❌ Programa '{nome_programa}' não encontrado."
 
                 with conn.cursor() as cur:
-                    # 1. Busca os dados do CONTRATO
+                    # 1. Busca os dados do CONTRATO com lock exclusivo para evitar race condition.
+                    # FOR UPDATE bloqueia a linha da assinatura até o commit, garantindo que
+                    # execuções concorrentes para a mesma assinatura aguardem e nunca passem
+                    # pela validação de saldo com dados desatualizados.
                     cur.execute("""
-                        SELECT id, cpm_fixo, milhas_garantidas_ciclo, valor_total_ciclo 
+                        SELECT id, cpm_fixo, milhas_garantidas_ciclo, valor_total_ciclo
                         FROM subscriptions
                         WHERE account_id = %s AND programa_id = %s AND ativo = TRUE
+                        ORDER BY created_at DESC
                         LIMIT 1
+                        FOR UPDATE
                     """, (acc_id, prog_id))
                     
                     sub = cur.fetchone()
@@ -766,10 +940,11 @@ class DatabaseManager(Toolkit):
                     )
 
         except Exception as e:
-            return f"❌ Erro ao processar: {str(e)}"
+            return _sanitize_error("process_monthly_credit", e)
         
 
-    def register_intra_club_transaction(self, 
+    @log_tool_call
+    def register_intra_club_transaction(self,
                                       nome_conta: str, 
                                       nome_programa: str, 
                                       milhas: int, 
@@ -809,6 +984,7 @@ class DatabaseManager(Toolkit):
                     cur.execute("""
                         SELECT id FROM subscriptions
                         WHERE account_id = %s AND programa_id = %s AND ativo = TRUE
+                        ORDER BY created_at DESC
                         LIMIT 1
                     """, (acc_id, prog_id))
                     
@@ -852,4 +1028,4 @@ class DatabaseManager(Toolkit):
                     )
 
         except Exception as e:
-            return f"❌ Erro: {str(e)}"
+            return _sanitize_error("register_intra_club_transaction", e)
