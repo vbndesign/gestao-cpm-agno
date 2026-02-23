@@ -158,6 +158,90 @@ class DatabaseManager(Toolkit):
             if row: return row[0]
             return None
 
+    def _parse_subscription_params(
+        self,
+        valor_total_ciclo: float,
+        milhas_garantidas_ciclo: int,
+        data_renovacao: str,
+        data_inicio: Optional[str],
+        is_mensal: bool,
+    ) -> Tuple[Optional[str], Optional[float], Optional[int], Optional[date], Optional[date], Optional[str]]:
+        """
+        Valida e normaliza os parâmetros de uma assinatura antes de qualquer acesso ao banco.
+        Retorna (error, valor_contrato, milhas_contrato, dt_inicio, data_renov_dt, tipo_contrato).
+        Se error não for None, todos os demais campos são None e o chamador deve retornar o erro.
+        """
+        if data_inicio:
+            dt_inicio = parse_date_natural(data_inicio, prefer_future=False)
+            if not dt_inicio:
+                return (
+                    f"❌ Erro: Não consegui interpretar a data de início '{data_inicio}'. "
+                    "Use formatos como 'DD/MM/AAAA' ou 'DD de mês de AAAA'.",
+                    None, None, None, None, None,
+                )
+        else:
+            dt_inicio = date.today()
+
+        data_renov_dt = parse_date_natural(data_renovacao, prefer_future=True)
+        if not data_renov_dt:
+            return (
+                f"❌ Erro: Não consegui interpretar a data de renovação '{data_renovacao}'. "
+                "Use formatos como 'daqui a 1 ano', 'DD/MM/AAAA' ou 'DD de mês de AAAA'.",
+                None, None, None, None, None,
+            )
+
+        if data_renov_dt <= dt_inicio:
+            return (
+                f"❌ Erro: A data de renovação deve ser posterior à data de início. "
+                f"Início: {dt_inicio.strftime('%d/%m/%Y')}, Renovação: {data_renov_dt.strftime('%d/%m/%Y')}.",
+                None, None, None, None, None,
+            )
+
+        if is_mensal:
+            valor_contrato = float(valor_total_ciclo) * 12
+            milhas_contrato = int(milhas_garantidas_ciclo) * 12
+            tipo_contrato = "MENSAL (Anualizado x12)"
+        else:
+            valor_contrato = float(valor_total_ciclo)
+            milhas_contrato = int(milhas_garantidas_ciclo)
+            tipo_contrato = "ANUAL (Valor Cheio)"
+
+        if valor_contrato <= 0:
+            return ("❌ Erro: valor_total_ciclo deve ser maior que zero.", None, None, None, None, None)
+        if milhas_contrato <= 0:
+            return ("❌ Erro: milhas_garantidas_ciclo deve ser maior que zero.", None, None, None, None, None)
+
+        return (None, valor_contrato, milhas_contrato, dt_inicio, data_renov_dt, tipo_contrato)
+
+    def _insert_subscription(
+        self,
+        conn: psycopg.Connection,
+        acc_id: str,
+        prog_id: str,
+        valor_contrato: float,
+        milhas_contrato: int,
+        dt_inicio: date,
+        data_renov_dt: date,
+    ) -> Optional[Tuple[str, float]]:
+        """
+        Executa o INSERT na tabela subscriptions usando a conexão fornecida.
+        Não faz commit — responsabilidade do chamador.
+        Retorna (new_sub_id, cpm_fixo) calculado pelo banco, ou None se o RETURNING não retornar linha.
+        """
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO subscriptions
+                (account_id, programa_id, valor_total_ciclo, milhas_garantidas_ciclo,
+                 data_inicio, data_renovacao, ativo)
+                VALUES (%s, %s, %s, %s, %s, %s, TRUE)
+                RETURNING id, cpm_fixo
+            """, (acc_id, prog_id, valor_contrato, milhas_contrato, dt_inicio, data_renov_dt),
+            prepare=False)
+            result = cur.fetchone()
+            if not result:
+                return None
+            return (str(result[0]), result[1])
+
     # --- Ferramentas Públicas (Disponíveis para o Agente) ---
     @log_tool_call
     def check_account_exists(self, nome_conta: str) -> str:
@@ -474,63 +558,33 @@ class DatabaseManager(Toolkit):
                 Use False quando o usuário informar valores anuais/totais.
         """
         try:
-            # Parse e validação de data de início
-            if data_inicio:
-                dt_inicio = parse_date_natural(data_inicio, prefer_future=False)
-                if not dt_inicio:
-                    return f"❌ Erro: Não consegui interpretar a data de início '{data_inicio}'. Use formatos como 'DD/MM/AAAA' ou 'DD de mês de AAAA'."
-            else:
-                dt_inicio = date.today()
-            
-            # Parse e validação de data de renovação (com preferência por futuro)
-            data_renov_dt = parse_date_natural(data_renovacao, prefer_future=True)
-            if not data_renov_dt:
-                return f"❌ Erro: Não consegui interpretar a data de renovação '{data_renovacao}'. Use formatos como 'daqui a 1 ano', 'DD/MM/AAAA' ou 'DD de mês de AAAA'."
-            
-            if data_renov_dt <= dt_inicio:
-                return f"❌ Erro: A data de renovação deve ser posterior à data de início. Início: {dt_inicio.strftime('%d/%m/%Y')}, Renovação: {data_renov_dt.strftime('%d/%m/%Y')}."
-
-            # Lógica de Anualização (Cálculo seguro no Python)
-            if is_mensal:
-                valor_contrato = float(valor_total_ciclo) * 12
-                milhas_contrato = int(milhas_garantidas_ciclo) * 12
-                tipo_contrato = "MENSAL (Anualizado x12)"
-            else:
-                valor_contrato = float(valor_total_ciclo)
-                milhas_contrato = int(milhas_garantidas_ciclo)
-                tipo_contrato = "ANUAL (Valor Cheio)"
-
-            # Validações de entrada
-            if valor_contrato <= 0:
-                return "❌ Erro: valor_total_ciclo deve ser maior que zero."
-            if milhas_contrato <= 0:
-                return "❌ Erro: milhas_garantidas_ciclo deve ser maior que zero."
+            err, valor_contrato, milhas_contrato, dt_inicio, data_renov_dt, tipo_contrato = \
+                self._parse_subscription_params(
+                    valor_total_ciclo, milhas_garantidas_ciclo,
+                    data_renovacao, data_inicio, is_mensal,
+                )
+            if err:
+                return err
+            assert valor_contrato is not None and milhas_contrato is not None
+            assert dt_inicio is not None and data_renov_dt is not None and tipo_contrato is not None
 
             with self._get_conn() as conn:
                 acc_id, acc_nome = self._get_account_id(conn, nome_conta)
-                if not acc_id: 
+                if not acc_id:
                     return f"❌ Conta '{nome_conta}' não encontrada."
-                
+
                 prog_id = self._get_program_id(conn, nome_programa)
-                if not prog_id: 
+                if not prog_id:
                     return f"❌ Programa '{nome_programa}' não encontrado."
-                
-                with conn.cursor() as cur:
-                    # Inserção com retorno do CPM calculado (usando valores do contrato)
-                    # Nota: data_fim é deixada NULL (assinatura ativa). Será preenchida apenas quando o contrato encerrar.
-                    cur.execute("""
-                        INSERT INTO subscriptions 
-                        (account_id, programa_id, valor_total_ciclo, milhas_garantidas_ciclo, data_inicio, data_renovacao, ativo)
-                        VALUES (%s, %s, %s, %s, %s, %s, TRUE)
-                        RETURNING cpm_fixo
-                    """, (acc_id, prog_id, valor_contrato, milhas_contrato, dt_inicio, data_renov_dt),
-                         prepare=False)
-                    
-                    result = cur.fetchone()
-                    if not result:
-                        return "❌ Erro: Não foi possível criar a assinatura."
-                    cpm_calculado = result[0]
-                
+
+                insert_result = self._insert_subscription(
+                    conn, acc_id, prog_id,
+                    valor_contrato, milhas_contrato, dt_inicio, data_renov_dt,
+                )
+                if insert_result is None:
+                    return "❌ Erro: Não foi possível criar a assinatura."
+                _, cpm_calculado = insert_result
+
                 conn.commit()
                 return (
                     f"✅ **Assinatura Criada com Sucesso!**\n"
@@ -539,11 +593,11 @@ class DatabaseManager(Toolkit):
                     f"💰 **Valor Global:** R$ {valor_contrato:.2f}\n"
                     f"📉 **CPM Travado:** R$ {cpm_calculado:.2f}\n"
                     f"� **Início:** {dt_inicio.strftime('%d/%m/%Y')}\n"
-                    f"�🔄 **Renovação:** {data_renov_dt.strftime('%d/%m/%Y')}\n"                    
-                    f"✅ **Status:** Ativo\n"                    
+                    f"�🔄 **Renovação:** {data_renov_dt.strftime('%d/%m/%Y')}\n"
+                    f"✅ **Status:** Ativo\n"
                     f"ℹ️ *Nota: O sistema baixará 1/12 desse saldo a cada mensalidade.*"
                 )
-                
+
         except Exception as e:
             return _sanitize_error("register_subscription", e)
         
@@ -569,48 +623,82 @@ class DatabaseManager(Toolkit):
             is_mensal: Se True, multiplica os valores por 12 para criar o contrato anual.
         """
         try:
-            # 1. Tratamento da Data (Reutilizando sua função auxiliar)
-            # Precisamos importar parse_date_natural ou tê-la disponível aqui
-            # data_renov_dt = parse_date_natural(data_renovacao) ... (se não tiver a validação aqui, o register vai fazer)
+            # 1. Valida e normaliza parâmetros antes de abrir conexão (fail-fast)
+            err, valor_contrato, milhas_contrato, dt_inicio, data_renov_dt, tipo_contrato = \
+                self._parse_subscription_params(
+                    valor_total_ciclo, milhas_garantidas_ciclo,
+                    data_renovacao, data_inicio, is_mensal,
+                )
+            if err:
+                return err
+            assert valor_contrato is not None and milhas_contrato is not None
+            assert dt_inicio is not None and data_renov_dt is not None and tipo_contrato is not None
 
+            # 2. UMA conexão, UMA transação — tudo atômico
             with self._get_conn() as conn:
-                # --- AQUI ESTÁ A LÓGICA DO NOME ---
-                # Usamos o nome para descobrir o ID
                 acc_id, acc_nome = self._get_account_id(conn, nome_conta)
-                if not acc_id: return f"❌ Conta '{nome_conta}' não encontrada."
+                if not acc_id:
+                    return f"❌ Conta '{nome_conta}' não encontrada."
 
+                prog_id = self._get_program_id(conn, nome_programa)
+                if not prog_id:
+                    return f"❌ Programa '{nome_programa}' não encontrado."
+
+                # 3. Desativa a assinatura ativa mais recente do programa (sem deletar)
+                #    O trigger trg_maintain_consistency seta ativo=FALSE automaticamente ao preencher data_fim
                 with conn.cursor() as cur:
-                    # 2. DELETA A ÚLTIMA ASSINATURA (Limpeza)
-                    # Busca a última criada baseada no timestamp para aquele ID
                     cur.execute("""
-                        DELETE FROM subscriptions 
+                        UPDATE subscriptions
+                        SET data_fim = CURRENT_DATE
                         WHERE id = (
-                            SELECT id FROM subscriptions 
-                            WHERE account_id = %s 
-                            ORDER BY created_at DESC 
+                            SELECT id FROM subscriptions
+                            WHERE account_id = %s AND programa_id = %s AND ativo = TRUE
+                            ORDER BY created_at DESC
                             LIMIT 1
                         )
                         RETURNING id;
-                    """, (acc_id,))
-                    
-                    deleted = cur.fetchone()
-                    msg_delecao = "(Anterior apagada 🗑️)" if deleted else "(Nenhuma anterior encontrada para apagar)"
-                
-                conn.commit() # Confirma a exclusão antes de tentar inserir a nova
-            
-            # 3. CHAMA A FUNÇÃO DE REGISTRO NORMAL
-            # Agora chamamos a função 'irmã' para recriar o registro limpo
-            resultado_novo = self.register_subscription(
-                nome_conta, 
-                nome_programa, 
-                valor_total_ciclo, 
-                milhas_garantidas_ciclo, 
-                data_renovacao,
-                data_inicio,
-                is_mensal
+                    """, (acc_id, prog_id), prepare=False)
+                    row = cur.fetchone()
+                old_sub_id = str(row[0]) if row else None
+
+                msg_anterior = (
+                    "(Anterior desativada — histórico preservado)"
+                    if old_sub_id else
+                    "(Nenhuma ativa encontrada — criando nova)"
+                )
+
+                # 4. Cria nova assinatura corrigida na mesma conexão
+                insert_result = self._insert_subscription(
+                    conn, acc_id, prog_id,
+                    valor_contrato, milhas_contrato, dt_inicio, data_renov_dt,
+                )
+                if insert_result is None:
+                    return "❌ Erro: Não foi possível criar a nova assinatura. A correção foi cancelada."
+                new_sub_id, cpm_calculado = insert_result
+
+                # 5. Re-vincula transações anteriores ao novo subscription_id
+                #    Mantém a trava de segurança de process_monthly_credit funcionando
+                if old_sub_id:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            UPDATE transactions
+                            SET subscription_id = %s
+                            WHERE subscription_id = %s
+                        """, (new_sub_id, old_sub_id), prepare=False)
+
+                # 6. Único commit — desativação + inserção + re-vínculo sobem juntos
+                conn.commit()
+
+            return (
+                f"✅ **Assinatura Corrigida com Sucesso!** {msg_anterior}\n"
+                f"📋 **Tipo:** {tipo_contrato}\n"
+                f"📊 **Contrato Anual:** {milhas_contrato:,} milhas\n"
+                f"💰 **Valor Global:** R$ {valor_contrato:.2f}\n"
+                f"📉 **CPM Travado:** R$ {cpm_calculado:.2f}\n"
+                f"📅 **Início:** {dt_inicio.strftime('%d/%m/%Y')}\n"
+                f"🔄 **Renovação:** {data_renov_dt.strftime('%d/%m/%Y')}\n"
+                f"✅ **Status:** Ativo"
             )
-            
-            return f"{resultado_novo} {msg_delecao}"
 
         except Exception as e:
             return _sanitize_error("correct_last_subscription", e)
