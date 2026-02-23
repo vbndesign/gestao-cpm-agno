@@ -9,6 +9,12 @@
 --
 -- Histórico de alterações aplicadas em PROD:
 --   migrations/prod/ → arquivos de referência de cada mudança
+--
+-- Convenção de migrations:
+--   1. Nomear: YYYYMMDD_NNN_descricao.sql  (ex: 20260222_001_add_feature.sql)
+--   2. Cada migration tem um _rollback.sql ao lado com o desfazer equivalente
+--   3. Sempre validar em DEV antes de aplicar em PROD
+--   4. Incluir ao final: INSERT INTO schema_migrations ... ON CONFLICT DO NOTHING
 -- ========================================================
 
 SET timezone = 'America/Sao_Paulo';
@@ -165,6 +171,17 @@ CREATE TABLE IF NOT EXISTS issuances (
     created_at TIMESTAMPTZ DEFAULT (NOW() AT TIME ZONE 'America/Sao_Paulo'),
     updated_at TIMESTAMPTZ DEFAULT (NOW() AT TIME ZONE 'America/Sao_Paulo')
 );
+
+-- --------------------------------------------------------
+-- RASTREAMENTO DE MIGRATIONS
+-- --------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS public.schema_migrations (
+    version     TEXT        PRIMARY KEY,
+    applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    description TEXT
+);
+ALTER TABLE public.schema_migrations ENABLE ROW LEVEL SECURITY;
 
 -- --------------------------------------------------------
 -- TRIGGERS

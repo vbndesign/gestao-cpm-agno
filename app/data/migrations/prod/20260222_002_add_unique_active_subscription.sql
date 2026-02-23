@@ -16,3 +16,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_subs_unique_active
 SELECT
     (SELECT COUNT(*) FROM pg_indexes
      WHERE tablename = 'subscriptions' AND indexname = 'idx_subs_unique_active') AS indice_deve_ser_1;
+
+-- Registrar migration como aplicada
+INSERT INTO schema_migrations (version, description)
+VALUES ('20260222_002_add_unique_active_subscription', 'Índice único parcial em subscriptions (account_id, programa_id) WHERE ativo = TRUE')
+ON CONFLICT DO NOTHING;
