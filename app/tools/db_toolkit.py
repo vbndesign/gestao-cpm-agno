@@ -61,19 +61,27 @@ class DatabaseManager(Toolkit):
         super().__init__(name="gerenciador_banco_dados")
         Database.initialize()
 
-        # --- ATUALIZAÇÃO: Registrando as novas ferramentas corretas ---
-        self.register(self.check_account_exists) # Nova: Para o agente "ver"
-        self.register(self.create_account)       # Renomeada e atualizada
+        # Contas e programas
+        self.register(self.check_account_exists)
+        self.register(self.create_account)
         self.register(self.get_programs)
+
+        # Transações e saldo
         self.register(self.save_simple_transaction)
         self.register(self.save_complex_transfer)
         self.register(self.get_dashboard)
+
+        # Assinaturas de clube
         self.register(self.register_subscription)
         self.register(self.correct_last_subscription)
-        self.register(self.delete_last_transaction)
-        self.register(self.confirm_delete_transaction)
         self.register(self.process_monthly_credit)
         self.register(self.register_intra_club_transaction)
+
+        # Deleção com confirmação em 2 etapas
+        self.register(self.delete_last_transaction)
+        self.register(self.confirm_delete_transaction)
+
+        # Protocolo de CPM (checkpoints e reajuste)
         self.register(self.confirm_cpm_checkpoint)
         self.register(self.get_cpm_summary)
         self.register(self.calculate_cpm_adjustment)
@@ -87,7 +95,7 @@ class DatabaseManager(Toolkit):
         """
         return Database.get_connection()
 
-    # --- Métodos Auxiliares (Privados) ---
+    # ── Helpers: normalização de identificadores ─────────────────────────────
 
     def _normalize_identifier(self, identificador: str) -> str:
         """
@@ -120,6 +128,8 @@ class DatabaseManager(Toolkit):
         dig1 = calc_digit(cpf_digits[:9])
         dig2 = calc_digit(cpf_digits[:9] + dig1)
         return cpf_digits[-2:] == dig1 + dig2
+
+    # ── Helpers: lookup de entidades no banco ────────────────────────────────
 
     def _get_account_id(self, conn: psycopg.Connection, identificador: str) -> Tuple[Optional[str], Optional[str]]:
         """Busca ID e Nome da conta por UUID, CPF ou Nome parcial."""
@@ -169,6 +179,8 @@ class DatabaseManager(Toolkit):
             row = cur.fetchone()
             if row: return row[0]
             return None
+
+    # ── Helpers: validação e inserção de assinaturas ─────────────────────────
 
     def _parse_subscription_params(
         self,
@@ -254,7 +266,8 @@ class DatabaseManager(Toolkit):
                 return None
             return (str(result[0]), result[1])
 
-    # --- Ferramentas Públicas (Disponíveis para o Agente) ---
+    # ── Ferramentas públicas: contas e programas ─────────────────────────────
+
     @log_tool_call
     def check_account_exists(self, nome_conta: str) -> str:
         """
@@ -329,6 +342,8 @@ class DatabaseManager(Toolkit):
         except Exception as e:
             return _sanitize_error("get_programs", e)
 
+    # ── Ferramentas públicas: transações e saldo ─────────────────────────────
+
     @log_tool_call
     def save_simple_transaction(self,
                               nome_conta: str, 
@@ -340,8 +355,8 @@ class DatabaseManager(Toolkit):
                               observacao: Optional[str] = None) -> str:
         """
         Registra uma compra simples de milhas ou entrada orgânica.
-        AGORA SUPORTA CÁLCULO DE BÔNUS AUTOMÁTICO.
-        
+        Suporta bônus sobre o valor base (ex: 25% de bônus aumenta as milhas creditadas).
+
         Args:
             bonus_percent: Percentual de bônus (ex: 25 para 25%)
             data_transacao: Data em formato padrão. IMPORTANTE: Quando o usuário usar 
@@ -385,13 +400,12 @@ class DatabaseManager(Toolkit):
                 cpm_real = (custo_final / total_milhas * 1000) if total_milhas > 0 else 0
                 
                 with conn.cursor() as cur:
-                    # ✅ CORREÇÃO: subscription_id explícito como None (NULL)
                     cur.execute("""
-                        INSERT INTO transactions 
+                        INSERT INTO transactions
                         (account_id, data_registro, data_transacao, modo_aquisicao, origem_id, destino_id, companhia_referencia_id,
                          milhas_base, bonus_percent, milhas_creditadas, custo_total, cpm_real, descricao, observacao, subscription_id)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """, (acc_id, date.today(), data_tx, modo.value, 
+                    """, (acc_id, date.today(), data_tx, modo.value,
                           prog_id, prog_id, prog_id, 
                           milhas_base, bonus, total_milhas, 
                           custo_final, cpm_real, descricao, observacao, None),
@@ -470,9 +484,8 @@ class DatabaseManager(Toolkit):
                 descricao = f"Transfer {origem_nome}→{destino_nome}: {lote_pago_qtd:,} pagos (R${lote_pago_custo_total:.2f}) + {lote_organico_qtd:,} orgânicos, bônus {bonus_percent}%"
 
                 with conn.cursor() as cur:
-                    # Desabilita prepared statements para evitar conflitos
                     cur.execute("""
-                        INSERT INTO transactions 
+                        INSERT INTO transactions
                         (account_id, data_registro, data_transacao, modo_aquisicao, origem_id, destino_id, companhia_referencia_id,
                          milhas_base, bonus_percent, milhas_creditadas, custo_total, cpm_real, descricao, observacao)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
@@ -509,7 +522,11 @@ class DatabaseManager(Toolkit):
 
     @log_tool_call
     def get_dashboard(self, identificador_conta: str) -> str:
-        """Consulta saldo consolidado e CPM médio."""
+        """
+        Retorna o extrato consolidado de milhas e CPM médio por programa.
+        Agrega todas as transações da conta, exibindo saldo total e custo médio
+        por milheiro em cada programa com saldo positivo.
+        """
         try:
             with self._get_conn() as conn:
                 acc_id, acc_nome = self._get_account_id(conn, identificador_conta)
@@ -545,6 +562,8 @@ class DatabaseManager(Toolkit):
         except Exception as e:
             return _sanitize_error("get_dashboard", e)
 
+    # ── Ferramentas públicas: assinaturas de clube ───────────────────────────
+
     @log_tool_call
     def register_subscription(self,
                             nome_conta: str, 
@@ -577,8 +596,10 @@ class DatabaseManager(Toolkit):
                 )
             if err:
                 return err
-            assert valor_contrato is not None and milhas_contrato is not None
-            assert dt_inicio is not None and data_renov_dt is not None and tipo_contrato is not None
+            # _parse_subscription_params garante que, sem erro, todos os campos são não-None.
+            if valor_contrato is None or milhas_contrato is None or dt_inicio is None \
+                    or data_renov_dt is None or tipo_contrato is None:
+                return _sanitize_error("register_subscription", ValueError("parse retornou None inesperado"))
 
             with self._get_conn() as conn:
                 acc_id, acc_nome = self._get_account_id(conn, nome_conta)
@@ -641,7 +662,7 @@ class DatabaseManager(Toolkit):
             is_mensal: Se True, multiplica os valores por 12 para criar o contrato anual.
         """
         try:
-            # 1. Valida e normaliza parâmetros antes de abrir conexão (fail-fast)
+            # 1. Valida e normaliza parâmetros antes de abrir conexão (fail-fast).
             err, valor_contrato, milhas_contrato, dt_inicio, data_renov_dt, tipo_contrato = \
                 self._parse_subscription_params(
                     valor_total_ciclo, milhas_garantidas_ciclo,
@@ -649,8 +670,10 @@ class DatabaseManager(Toolkit):
                 )
             if err:
                 return err
-            assert valor_contrato is not None and milhas_contrato is not None
-            assert dt_inicio is not None and data_renov_dt is not None and tipo_contrato is not None
+            # _parse_subscription_params garante que, sem erro, todos os campos são não-None.
+            if valor_contrato is None or milhas_contrato is None or dt_inicio is None \
+                    or data_renov_dt is None or tipo_contrato is None:
+                return _sanitize_error("correct_last_subscription", ValueError("parse retornou None inesperado"))
 
             # 2. UMA conexão, UMA transação — tudo atômico
             with self._get_conn() as conn:
@@ -720,6 +743,8 @@ class DatabaseManager(Toolkit):
 
         except Exception as e:
             return _sanitize_error("correct_last_subscription", e)
+
+    # ── Ferramentas públicas: deleção com confirmação em 2 etapas ────────────
 
     @log_tool_call
     def delete_last_transaction(self,
@@ -894,8 +919,15 @@ class DatabaseManager(Toolkit):
     @log_tool_call
     def process_monthly_credit(self, nome_conta: str, nome_programa: str, milhas_do_mes: int = 0) -> str:
         """
-        Registra a entrada mensal (Recorrência) com TRAVA DE SEGURANÇA.
-        Não permite creditar mais milhas do que o total contratado na assinatura.
+        Registra a entrada mensal de milhas de um clube de assinatura.
+
+        Aplica uma trava de segurança: bloqueia o crédito se a soma de todas as
+        entradas anteriores mais a nova parcela ultrapassar o total contratado no ciclo.
+        Isso previne sobrecrédito acidental por parte do agente.
+
+        Args:
+            milhas_do_mes: Quantidade a creditar neste mês. Se omitido ou zero,
+                calcula automaticamente 1/12 do contrato (média linear mensal).
         """
         try:
             with self._get_conn() as conn:
@@ -932,20 +964,17 @@ class DatabaseManager(Toolkit):
                         qtd_inserir = int(milhas_totais_contrato / 12)
                         obs_origem = "(Média linear)"
 
-                    # --- 🛡️ TRAVA DE SEGURANÇA ---
+                    # Trava de segurança: soma todas as milhas já creditadas nesta assinatura
+                    # e verifica se há saldo suficiente para a nova parcela.
                     cur.execute("""
-                        SELECT COALESCE(SUM(milhas_creditadas), 0) 
-                        FROM transactions 
+                        SELECT COALESCE(SUM(milhas_creditadas), 0)
+                        FROM transactions
                         WHERE subscription_id = %s
                     """, (sub_id,))
-                    
-                    # Correção: O fetchone retorna uma tupla, pegamos o índice [0]
                     result = cur.fetchone()
                     total_ja_creditado = result[0] if result else 0
-                    
                     saldo_restante = milhas_totais_contrato - total_ja_creditado
 
-                    # Validação Matemática (Dentro do process_monthly_credit)
                     if qtd_inserir > saldo_restante:
                         return (
                             f"⛔ **BLOQUEIO DE SEGURANÇA**\n"
@@ -958,27 +987,28 @@ class DatabaseManager(Toolkit):
                             f"💡 *Dica: Se isso for um bônus extra, solicite uma nova operação de 'Compra Avulsa' ou 'Bônus' separadamente.*" 
                         )
 
-                    # 3. Cálculos
+                    # 3. Cálculo do custo contábil proporcional à parcela creditada.
                     custo_contabil = (qtd_inserir / 1000) * float(cpm_fixo)
-                    
-                    # AQUI A CORREÇÃO PRINCIPAL:
-                    # Usamos o CPM do contrato direto (sem recalcular) e o Modo CLUBE
+
+                    # Usa o CPM fixo do contrato diretamente (sem recalcular sobre float)
+                    # para evitar dízimas e garantir consistência com o valor travado na assinatura.
+                    # Modo CLUBE_ASSINATURA distingue créditos de contrato de compras avulsas.
                     cur.execute("""
-                        INSERT INTO transactions 
+                        INSERT INTO transactions
                         (account_id, data_registro, data_transacao, modo_aquisicao, origem_id, destino_id, companhia_referencia_id,
                          milhas_base, bonus_percent, milhas_creditadas, custo_total, cpm_real, descricao, subscription_id)
                         VALUES (%s, CURRENT_DATE, CURRENT_DATE, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s)
                     """, (
-                        acc_id, 
-                        ModoAquisicao.CLUBE.value, # <--- CORRIGIDO: Era ORGANICO, agora é CLUBE ('CLUBE_ASSINATURA')
-                        prog_id, prog_id, prog_id, # Origem/Destino/Ref = Programa (Internalização)
-                        qtd_inserir, # milhas_base
-                        qtd_inserir, # milhas_creditadas
+                        acc_id,
+                        ModoAquisicao.CLUBE.value,
+                        prog_id, prog_id, prog_id,  # origem/destino/ref = programa (operação interna)
+                        qtd_inserir,                # milhas_base
+                        qtd_inserir,                # milhas_creditadas (sem bônus em créditos de clube)
                         custo_contabil,
-                        cpm_fixo, # <--- CORRIGIDO: Usa o valor fixo direto do banco para evitar dízimas
-                        f'Crédito Mensal Clube - {nome_programa}', 
+                        cpm_fixo,
+                        f'Crédito Mensal Clube - {nome_programa}',
                         sub_id
-                    ), prepare=False) # Mantive o prepare=False pois parece ser necessário no seu driver
+                    ), prepare=False)
                     
                     # Verifica Fim de Ciclo
                     aviso_fim = ""
@@ -1002,31 +1032,35 @@ class DatabaseManager(Toolkit):
 
     @log_tool_call
     def register_intra_club_transaction(self,
-                                      nome_conta: str, 
-                                      nome_programa: str, 
-                                      milhas: int, 
+                                      nome_conta: str,
+                                      nome_programa: str,
+                                      milhas: int,
                                       custo_total: float,
                                       descricao: str,
-                                      bonus_percent: float = 0.0) -> str: # <--- Novo Parâmetro
+                                      bonus_percent: float = 0.0) -> str:
         """
-        Registra transações intra-clube.
-        Agora aceita 'bonus_percent' para que o Python faça o cálculo final de milhas.
+        Registra uma transação avulsa dentro de um clube de assinatura ativo.
+        Usada para bônus pontuais, compras adicionais e créditos orgânicos do clube
+        que não fazem parte da recorrência mensal.
+
+        Args:
+            milhas: Milhas base da operação (antes do bônus).
+            custo_total: Custo em reais. Se zero ou negativo, registra como ORGANICO.
+            descricao: Texto descritivo fornecido pelo usuário ou agente.
+            bonus_percent: Percentual de bônus sobre as milhas base (ex: 25 para 25%).
         """
         try:
-            # 1. Cálculo Deterministico (Python)
             milhas_base = int(milhas)
             bonus = float(bonus_percent)
-            
-            # Fórmula: Base + (Base * (Bonus/100))
+            # Milhas finais = base + bônus proporcional
             total_milhas = int(milhas_base * (1 + bonus / 100))
-            
-            # Define Modo
+
             if custo_total <= 0:
-                modo = "ORGANICO" # ModoAquisicao.ORGANICO.value
+                modo = ModoAquisicao.ORGANICO.value
                 custo_final = 0.0
                 tag_desc = "(Bônus/Orgânico Clube)"
             else:
-                modo = "COMPRA_SIMPLES" # ModoAquisicao.COMPRA_SIMPLES.value
+                modo = ModoAquisicao.COMPRA_SIMPLES.value
                 custo_final = float(custo_total)
                 tag_desc = f"(Compra Clube + {int(bonus)}% Bônus)"
 
@@ -1055,24 +1089,23 @@ class DatabaseManager(Toolkit):
 
                     full_desc = f"{descricao} {tag_desc}"
                     
-                    # Insert completo preenchendo as colunas de Base e Bônus separadas
                     cur.execute("""
-                        INSERT INTO transactions 
+                        INSERT INTO transactions
                         (account_id, data_registro, data_transacao, modo_aquisicao, origem_id, destino_id, companhia_referencia_id,
                          milhas_base, bonus_percent, milhas_creditadas, custo_total, cpm_real, descricao, subscription_id)
                         VALUES (%s, CURRENT_DATE, CURRENT_DATE, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """, (
-                        acc_id, 
-                        modo, 
+                        acc_id,
+                        modo,
                         prog_id, prog_id, prog_id,
-                        milhas_base,   # Coluna milhas_base
-                        bonus,         # Coluna bonus_percent
-                        total_milhas,  # Coluna milhas_creditadas (Calculado pelo Python)
-                        custo_final, 
-                        cpm_transacao, 
-                        full_desc, 
+                        milhas_base,
+                        bonus,
+                        total_milhas,
+                        custo_final,
+                        cpm_transacao,
+                        full_desc,
                         sub_id
-                    ))
+                    ), prepare=False)
                     
                     conn.commit()
                     
@@ -1087,16 +1120,23 @@ class DatabaseManager(Toolkit):
         except Exception as e:
             return _sanitize_error("register_intra_club_transaction", e)
 
-    # -------------------------------------------------------------------------
-    # PROTOCOLO DE REAJUSTE DE CPM — Helpers privados
-    # -------------------------------------------------------------------------
+    # ── Protocolo de CPM: helpers privados ───────────────────────────────────
 
     def _get_cpm_totals(self, conn: psycopg.Connection, acc_id: str, prog_id: str):
         """
         Retorna (total_milhas, total_custo, checkpoint, delta) combinando o
         último checkpoint com as transações posteriores.
-        delta = (count, sum_milhas, sum_custo, min_dt, max_dt, count_ajustes)
-        checkpoint = dict com campos do registro, ou None se não houver.
+
+        Padrão base + delta:
+          - Se há checkpoint: total = snapshot acumulado + transações POSTERIORES à data do checkpoint.
+            Isso torna a reconciliação incremental — não relê o histórico inteiro a cada consulta.
+          - Se não há checkpoint: total = soma de TODAS as transações do programa.
+
+        Retornos:
+            total_milhas: milhas acumuladas (base + delta)
+            total_custo:  custo acumulado (base + delta)
+            checkpoint:   dict com campos do registro, ou None se não houver
+            delta:        tupla (count, sum_milhas, sum_custo, min_dt, max_dt, count_ajustes)
         """
         checkpoint = None
         with conn.cursor() as cur:
@@ -1116,6 +1156,8 @@ class DatabaseManager(Toolkit):
                     "tipo": row[5], "periodo_referencia": row[6],
                 }
 
+            # Filtra apenas as transações posteriores ao checkpoint (se existir),
+            # evitando reprocessar o histórico já consolidado no snapshot.
             cutoff = checkpoint["created_at"] if checkpoint else None
             if cutoff:
                 cur.execute("""
@@ -1202,9 +1244,7 @@ class DatabaseManager(Toolkit):
             row = cur.fetchone()
             return str(row[0]) if row else ""
 
-    # -------------------------------------------------------------------------
-    # PROTOCOLO DE REAJUSTE DE CPM — Ferramentas públicas
-    # -------------------------------------------------------------------------
+    # ── Protocolo de CPM: ferramentas públicas ───────────────────────────────
 
     @log_tool_call
     def confirm_cpm_checkpoint(
@@ -1286,7 +1326,8 @@ class DatabaseManager(Toolkit):
                 tag = f"[Fechamento: {periodo_referencia}]" if tipo == "MENSAL" else f"[{tipo}]"
                 periodo_txt = ""
                 if delta and delta[3] and delta[4]:
-                    periodo_txt = f"\n   Período coberto: {delta[3].strftime('%d/%m')} a {delta[4].strftime('%d/%m/%Y')}"
+                    dt_ini, dt_fim = delta[3], delta[4]
+                    periodo_txt = f"\n   Período coberto: {dt_ini.strftime('%d/%m')} a {dt_fim.strftime('%d/%m/%Y')}"
 
                 return (
                     f"✅ Checkpoint de CPM registrado! {tag}\n"
@@ -1491,7 +1532,9 @@ class DatabaseManager(Toolkit):
                         custo, descricao_tx, observacao,
                     ))
 
-                # Checkpoint AUTO na mesma transação de banco
+                # Checkpoint AUTO criado imediatamente após o ajuste, na mesma transação de banco.
+                # Isso garante que reconciliações futuras partam do estado pós-ajuste,
+                # sem reprocessar o delta antigo que motivou o ajuste.
                 total_milhas, total_custo, _, delta = self._get_cpm_totals(conn, acc_id, prog_id)
                 self._insert_cpm_checkpoint(
                     conn, acc_id, prog_id, nome_programa,
