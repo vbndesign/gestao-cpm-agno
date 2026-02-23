@@ -125,9 +125,9 @@ async def process_slack_message(event: dict):
         }, exc_info=True)
         try:
             slack_client.chat_postMessage(
-                channel=channel_id, 
-                text=f"⚠️ Erro interno: {str(e)}",
-                thread_ts=target_thread # Avisa o erro na thread certa também
+                channel=channel_id,
+                text=f"⚠️ Algo deu errado. Se precisar de suporte, mencione o código: `{session_id}`",
+                thread_ts=target_thread
             )
         except: pass
 

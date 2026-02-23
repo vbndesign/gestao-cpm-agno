@@ -3,6 +3,7 @@ import logging
 import psycopg
 import re
 import time
+import uuid
 from datetime import date
 from typing import Optional, Tuple
 from agno.tools import Toolkit
@@ -11,6 +12,18 @@ from app.core.enums import TipoLote, ModoAquisicao
 from app.tools.date_parser import parse_date_natural
 
 _logger = logging.getLogger("wf_milhas.tools")
+
+
+def _sanitize_error(tool_name: str, e: Exception) -> str:
+    """Loga a exceção real e retorna mensagem genérica com ref rastreável ao agente (segurança)."""
+    ref = uuid.uuid4().hex[:8]
+    _logger.error("tool_exception", extra={
+        "event": "tool_exception",
+        "tool": tool_name,
+        "error_type": type(e).__name__,
+        "ref": ref,
+    }, exc_info=True)
+    return f"❌ Erro interno ao executar '{tool_name}' [ref: {ref}]. Operação não concluída."
 
 
 def log_tool_call(func):
@@ -160,7 +173,7 @@ class DatabaseManager(Toolkit):
                     return f"✅ Conta encontrada: {acc_nome} (ID: {acc_id})"
                 return "❌ Conta não encontrada. Verifique o nome ou inicie o cadastro."
         except Exception as e:
-            return f"Erro na busca: {str(e)}"
+            return _sanitize_error("check_account_exists", e)
 
     @log_tool_call
     def create_account(self, nome_completo: str, tipo_gestao: str, cpf: str) -> str:
@@ -202,7 +215,7 @@ class DatabaseManager(Toolkit):
 
             return f"✅ Conta criada com sucesso para **{nome_completo}** ({tipo})! ID: {account_id}"
         except Exception as e:
-            return f"❌ Erro Técnico ao criar conta: {str(e)}"
+            return _sanitize_error("create_account", e)
 
     @log_tool_call
     def get_programs(self) -> str:
@@ -217,7 +230,8 @@ class DatabaseManager(Toolkit):
                 return "Nenhum programa encontrado."
             
             return "📋 Programas Disponíveis:\n" + "\n".join([f"- {r[0]} ({r[1]})" for r in rows])
-        except Exception as e: return f"Erro ao buscar programas: {str(e)}"
+        except Exception as e:
+            return _sanitize_error("get_programs", e)
 
     @log_tool_call
     def save_simple_transaction(self,
@@ -296,8 +310,8 @@ class DatabaseManager(Toolkit):
                         f"💰 **CPM Final:** R$ {cpm_real:.2f}"
                     )
             
-        except Exception as e: 
-            return f"❌ Erro ao salvar transação: {str(e)}"
+        except Exception as e:
+            return _sanitize_error("save_simple_transaction", e)
 
     @log_tool_call
     def save_complex_transfer(self,
@@ -394,10 +408,8 @@ class DatabaseManager(Toolkit):
 
                 conn.commit()
                 return f"✅ Transferência Salva para {acc_nome}! CPM Final: **R$ {cpm_real:.2f}**"
-        except psycopg.Error as db_err:
-            return f"❌ Erro de Banco de Dados: {type(db_err).__name__} - {str(db_err)}"
-        except Exception as e: 
-            return f"❌ Erro na transferência: {type(e).__name__} - {str(e)}"
+        except Exception as e:
+            return _sanitize_error("save_complex_transfer", e)
 
     @log_tool_call
     def get_dashboard(self, identificador_conta: str) -> str:
@@ -434,7 +446,8 @@ class DatabaseManager(Toolkit):
             res += f"\n**Total Geral:** {total_milhas:,.0f} milhas"
             return res
 
-        except Exception as e: return f"❌ Erro ao consultar dashboard: {str(e)}"
+        except Exception as e:
+            return _sanitize_error("get_dashboard", e)
 
     @log_tool_call
     def register_subscription(self,
@@ -532,7 +545,7 @@ class DatabaseManager(Toolkit):
                 )
                 
         except Exception as e:
-            return f"❌ Erro ao registrar assinatura: {str(e)}"
+            return _sanitize_error("register_subscription", e)
         
 
     @log_tool_call
@@ -600,7 +613,7 @@ class DatabaseManager(Toolkit):
             return f"{resultado_novo} {msg_delecao}"
 
         except Exception as e:
-            return f"❌ Erro ao corrigir: {str(e)}"
+            return _sanitize_error("correct_last_subscription", e)
 
     @log_tool_call
     def delete_last_transaction(self,
@@ -703,7 +716,7 @@ class DatabaseManager(Toolkit):
                     )
 
         except Exception as e:
-            return f"❌ Erro ao deletar transação: {str(e)}"
+            return _sanitize_error("delete_last_transaction", e)
 
     @log_tool_call
     def process_monthly_credit(self, nome_conta: str, nome_programa: str, milhas_do_mes: int = 0) -> str:
@@ -806,7 +819,7 @@ class DatabaseManager(Toolkit):
                     )
 
         except Exception as e:
-            return f"❌ Erro ao processar: {str(e)}"
+            return _sanitize_error("process_monthly_credit", e)
         
 
     @log_tool_call
@@ -893,4 +906,4 @@ class DatabaseManager(Toolkit):
                     )
 
         except Exception as e:
-            return f"❌ Erro: {str(e)}"
+            return _sanitize_error("register_intra_club_transaction", e)

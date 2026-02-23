@@ -9,10 +9,10 @@ class Settings(BaseSettings):
     database_url: str = Field(...)
     slack_bot_token: str = Field(...)
     slack_signing_secret: str = Field(...)
-    
+
     # Configurações com valor padrão (Opcionais)
     port: int = 10000
-    app_env: str = "production"  # dev, staging, production
+    app_env: str = "prod"  # dev, staging, prod
     log_level: str = "INFO"
 
     class Config:
