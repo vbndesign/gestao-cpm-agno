@@ -13,6 +13,12 @@ from app.tools.date_parser import parse_date_natural
 
 _logger = logging.getLogger("wf_milhas.tools")
 
+_MESES_PT = {
+    1: "janeiro", 2: "fevereiro", 3: "março", 4: "abril",
+    5: "maio", 6: "junho", 7: "julho", 8: "agosto",
+    9: "setembro", 10: "outubro", 11: "novembro", 12: "dezembro",
+}
+
 
 def _sanitize_error(tool_name: str, e: Exception) -> str:
     """Loga a exceção real e retorna mensagem genérica com ref rastreável ao agente (segurança)."""
@@ -68,6 +74,11 @@ class DatabaseManager(Toolkit):
         self.register(self.confirm_delete_transaction)
         self.register(self.process_monthly_credit)
         self.register(self.register_intra_club_transaction)
+        self.register(self.confirm_cpm_checkpoint)
+        self.register(self.get_cpm_summary)
+        self.register(self.calculate_cpm_adjustment)
+        self.register(self.apply_cpm_adjustment)
+        self.register(self.get_client_panorama)
 
     def _get_conn(self):
         """
@@ -1029,3 +1040,527 @@ class DatabaseManager(Toolkit):
 
         except Exception as e:
             return _sanitize_error("register_intra_club_transaction", e)
+
+    # -------------------------------------------------------------------------
+    # PROTOCOLO DE REAJUSTE DE CPM — Helpers privados
+    # -------------------------------------------------------------------------
+
+    def _get_cpm_totals(self, conn: psycopg.Connection, acc_id: str, prog_id: str):
+        """
+        Retorna (total_milhas, total_custo, checkpoint, delta) combinando o
+        último checkpoint com as transações posteriores.
+        delta = (count, sum_milhas, sum_custo, min_dt, max_dt, count_ajustes)
+        checkpoint = dict com campos do registro, ou None se não houver.
+        """
+        checkpoint = None
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, total_milhas, total_custo, cpm_snapshot, created_at,
+                       tipo, periodo_referencia
+                FROM cpm_checkpoints
+                WHERE account_id = %s AND programa_id = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+            """, (acc_id, prog_id))
+            row = cur.fetchone()
+            if row:
+                checkpoint = {
+                    "id": row[0], "total_milhas": row[1], "total_custo": float(row[2]),
+                    "cpm_snapshot": float(row[3]), "created_at": row[4],
+                    "tipo": row[5], "periodo_referencia": row[6],
+                }
+
+            cutoff = checkpoint["created_at"] if checkpoint else None
+            if cutoff:
+                cur.execute("""
+                    SELECT COUNT(*),
+                           COALESCE(SUM(milhas_creditadas), 0),
+                           COALESCE(SUM(custo_total), 0),
+                           MIN(data_transacao),
+                           MAX(data_transacao),
+                           COUNT(*) FILTER (WHERE modo_aquisicao = 'AJUSTE_CPM')
+                    FROM transactions
+                    WHERE account_id = %s AND companhia_referencia_id = %s
+                      AND created_at > %s
+                """, (acc_id, prog_id, cutoff))
+            else:
+                cur.execute("""
+                    SELECT COUNT(*),
+                           COALESCE(SUM(milhas_creditadas), 0),
+                           COALESCE(SUM(custo_total), 0),
+                           MIN(data_transacao),
+                           MAX(data_transacao),
+                           COUNT(*) FILTER (WHERE modo_aquisicao = 'AJUSTE_CPM')
+                    FROM transactions
+                    WHERE account_id = %s AND companhia_referencia_id = %s
+                """, (acc_id, prog_id))
+            delta = cur.fetchone() or (0, 0, 0.0, None, None, 0)
+
+        base_milhas = checkpoint["total_milhas"] if checkpoint else 0
+        base_custo  = checkpoint["total_custo"]  if checkpoint else 0.0
+        total_milhas = base_milhas + int(delta[1] or 0)
+        total_custo  = base_custo  + float(delta[2] or 0)
+        return total_milhas, total_custo, checkpoint, delta
+
+    def _build_checkpoint_descricao(
+        self, tipo: str, programa_nome: str,
+        periodo_referencia: Optional[str] = None,
+        tipo_ajuste: Optional[str] = None,
+        valor_ajuste: Optional[float] = None,
+    ) -> str:
+        """Gera a descrição automática do checkpoint conforme o tipo."""
+        if tipo == "MENSAL":
+            ano, mes = map(int, (periodo_referencia or "").split("-"))
+            return f"Fechamento {_MESES_PT[mes]}/{ano} — {programa_nome}"
+        elif tipo == "AUTO":
+            if tipo_ajuste == "CUSTO":
+                return f"[Auto] Pós-ajuste de custo: {(valor_ajuste or 0):+.2f} — {programa_nome}"
+            else:
+                return f"[Auto] Pós-ajuste de milhas: {int(valor_ajuste or 0):+,} mi — {programa_nome}"
+        else:
+            return f"Confirmação de CPM — {programa_nome}"
+
+    def _insert_cpm_checkpoint(
+        self, conn: psycopg.Connection,
+        acc_id: str, prog_id: str, programa_nome: str,
+        tipo: str, total_milhas: int, total_custo: float, delta: Optional[tuple],
+        periodo_referencia: Optional[str] = None,
+        observacao: Optional[str] = None,
+        tipo_ajuste: Optional[str] = None,
+        valor_ajuste: Optional[float] = None,
+    ) -> str:
+        """
+        Insere em cpm_checkpoints. Não faz commit — responsabilidade do chamador.
+        Retorna o id do checkpoint criado.
+        """
+        cpm_snapshot = round(total_custo / total_milhas * 1000, 2) if total_milhas > 0 else 0.0
+        descricao = self._build_checkpoint_descricao(
+            tipo, programa_nome, periodo_referencia, tipo_ajuste, valor_ajuste
+        )
+        delta_inicio = delta[3] if delta else None
+        delta_fim    = delta[4] if delta else None
+
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO cpm_checkpoints
+                (account_id, programa_id, data_checkpoint, total_milhas, total_custo,
+                 cpm_snapshot, tipo, periodo_referencia, delta_data_inicio, delta_data_fim,
+                 descricao, observacao)
+                VALUES (%s, %s, CURRENT_DATE, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (
+                acc_id, prog_id, total_milhas, total_custo, cpm_snapshot,
+                tipo, periodo_referencia, delta_inicio, delta_fim,
+                descricao, observacao,
+            ))
+            row = cur.fetchone()
+            return str(row[0]) if row else ""
+
+    # -------------------------------------------------------------------------
+    # PROTOCOLO DE REAJUSTE DE CPM — Ferramentas públicas
+    # -------------------------------------------------------------------------
+
+    @log_tool_call
+    def confirm_cpm_checkpoint(
+        self,
+        nome_conta: str,
+        nome_programa: str,
+        tipo: str,
+        periodo_referencia: Optional[str] = None,
+        observacao: Optional[str] = None,
+    ) -> str:
+        """
+        Cria um checkpoint de CPM confirmando que o estado atual está correto.
+
+        tipo: 'MENSAL' (fechamento de mês), 'MANUAL' (confirmação pontual).
+        periodo_referencia: obrigatório para tipo='MENSAL', formato 'YYYY-MM'
+            (ex: '2026-01' para fechar janeiro/2026).
+        observacao: campo livre opcional do usuário.
+        """
+        try:
+            tipo = tipo.upper().strip()
+            if tipo not in ("MENSAL", "MANUAL"):
+                return "❌ tipo deve ser 'MENSAL' ou 'MANUAL'."
+            if tipo == "MENSAL":
+                if not periodo_referencia:
+                    return "❌ Para tipo='MENSAL', informe o periodo_referencia no formato 'YYYY-MM'."
+                try:
+                    ano, mes = map(int, periodo_referencia.split("-"))
+                    if not (1 <= mes <= 12):
+                        raise ValueError
+                except ValueError:
+                    return f"❌ periodo_referencia inválido: '{periodo_referencia}'. Use o formato 'YYYY-MM'."
+                hoje_ref = date.today()
+                if (ano, mes) > (hoje_ref.year, hoje_ref.month):
+                    return f"❌ Não é possível fechar um mês futuro ({periodo_referencia})."
+
+            with self._get_conn() as conn:
+                acc_id, acc_nome = self._get_account_id(conn, nome_conta)
+                if not acc_id:
+                    return f"❌ Conta '{nome_conta}' não encontrada."
+                prog_id = self._get_program_id(conn, nome_programa)
+                if not prog_id:
+                    return f"❌ Programa '{nome_programa}' não encontrado."
+
+                if tipo == "MENSAL":
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            SELECT id FROM cpm_checkpoints
+                            WHERE account_id = %s AND programa_id = %s
+                              AND periodo_referencia = %s
+                        """, (acc_id, prog_id, periodo_referencia))
+                        if cur.fetchone():
+                            ano, mes = map(int, (periodo_referencia or "").split("-"))
+                            return (
+                                f"⛔ {_MESES_PT[mes].capitalize()}/{ano} já foi fechado para "
+                                f"{nome_programa} / {acc_nome}. Não é possível duplicar o fechamento."
+                            )
+
+                total_milhas, total_custo, _, delta = self._get_cpm_totals(conn, acc_id, prog_id)
+                if total_milhas <= 0:
+                    return f"❌ Nenhuma transação encontrada para {nome_programa} / {acc_nome}."
+
+                try:
+                    self._insert_cpm_checkpoint(
+                        conn, acc_id, prog_id, nome_programa,
+                        tipo, total_milhas, total_custo, delta,
+                        periodo_referencia=periodo_referencia,
+                        observacao=observacao,
+                    )
+                    conn.commit()
+                except psycopg.errors.UniqueViolation:
+                    conn.rollback()
+                    ano_dup, mes_dup = map(int, (periodo_referencia or "").split("-"))
+                    return (
+                        f"⛔ {_MESES_PT[mes_dup].capitalize()}/{ano_dup} já foi fechado para "
+                        f"{nome_programa} / {acc_nome}. Não é possível duplicar o fechamento."
+                    )
+
+                cpm = round(total_custo / total_milhas * 1000, 2)
+                tag = f"[Fechamento: {periodo_referencia}]" if tipo == "MENSAL" else f"[{tipo}]"
+                periodo_txt = ""
+                if delta and delta[3] and delta[4]:
+                    periodo_txt = f"\n   Período coberto: {delta[3].strftime('%d/%m')} a {delta[4].strftime('%d/%m/%Y')}"
+
+                return (
+                    f"✅ Checkpoint de CPM registrado! {tag}\n"
+                    f"📊 {nome_programa} / {acc_nome} — {date.today().strftime('%d/%m/%Y')}"
+                    f"{periodo_txt}\n"
+                    f"   Total acumulado: {total_milhas:,} milhas | R$ {total_custo:,.2f}\n"
+                    f"   **CPM confirmado: R$ {cpm:.2f}**\n\n"
+                    f"ℹ️ Próximas reconciliações partirão deste ponto."
+                )
+
+        except Exception as e:
+            return _sanitize_error("confirm_cpm_checkpoint", e)
+
+    @log_tool_call
+    def get_cpm_summary(self, nome_conta: str, nome_programa: str) -> str:
+        """
+        Retorna um resumo compacto do estado atual de CPM para uma conta e programa.
+        Parte do último checkpoint (se houver) e mostra o delta de transações novas.
+        Sinaliza se há mais de 10 transações sem checkpoint (sugestão de confirmação).
+        """
+        try:
+            with self._get_conn() as conn:
+                acc_id, acc_nome = self._get_account_id(conn, nome_conta)
+                if not acc_id:
+                    return f"❌ Conta '{nome_conta}' não encontrada."
+                prog_id = self._get_program_id(conn, nome_programa)
+                if not prog_id:
+                    return f"❌ Programa '{nome_programa}' não encontrado."
+
+                total_milhas, total_custo, checkpoint, delta = self._get_cpm_totals(
+                    conn, acc_id, prog_id
+                )
+
+            if total_milhas <= 0:
+                return f"❌ Nenhuma transação encontrada para {nome_programa} / {acc_nome}."
+
+            cpm_atual = round(total_custo / total_milhas * 1000, 2)
+            delta_count    = int(delta[0] or 0)
+            delta_milhas   = int(delta[1] or 0)
+            delta_custo    = float(delta[2] or 0)
+            delta_ajustes  = int(delta[5] or 0)
+
+            if checkpoint:
+                chk_data = checkpoint["created_at"].strftime("%d/%m/%Y")
+                chk_tipo = checkpoint["tipo"]
+                chk_cpm  = checkpoint["cpm_snapshot"]
+                chk_ref  = f" ({checkpoint['periodo_referencia']})" if checkpoint["periodo_referencia"] else f" ({chk_tipo})"
+                chk_line = f"Último checkpoint: {chk_data}{chk_ref} — CPM confirmado: **R$ {chk_cpm:.2f}**"
+            else:
+                chk_line = "Sem checkpoint anterior — análise de todo o histórico"
+
+            ajuste_line = f"\n  Ajustes de CPM aplicados: {delta_ajustes}" if delta_ajustes > 0 else ""
+            aviso_volume = ""
+            if delta_count > 10:
+                aviso_volume = (
+                    f"\n\n📌 Há {delta_count} transações sem checkpoint (limite: 10). "
+                    "Se o CPM estiver correto, posso confirmar agora para agilizar futuras reconciliações."
+                )
+
+            return (
+                f"📊 Resumo CPM — {nome_programa} / {acc_nome}\n"
+                f"─────────────────────────────────\n"
+                f"{chk_line}\n"
+                f"Transações desde então: {delta_count}\n"
+                f"  Milhas novas: +{delta_milhas:,}  |  Custo novo: R$ {delta_custo:,.2f}"
+                f"{ajuste_line}\n\n"
+                f"Posição atual:\n"
+                f"  Total acumulado: {total_milhas:,} milhas | R$ {total_custo:,.2f}\n"
+                f"  **CPM Médio atual: R$ {cpm_atual:.2f}**"
+                f"{aviso_volume}"
+            )
+
+        except Exception as e:
+            return _sanitize_error("get_cpm_summary", e)
+
+    @log_tool_call
+    def calculate_cpm_adjustment(
+        self, nome_conta: str, nome_programa: str, cpm_alvo: float
+    ) -> str:
+        """
+        Calcula o ajuste necessário para atingir um CPM-alvo.
+        Não cria nada — apenas calcula e retorna as opções.
+
+        cpm_alvo: CPM desejado em R$/milheiro (ex: 18.00).
+        """
+        try:
+            with self._get_conn() as conn:
+                acc_id, acc_nome = self._get_account_id(conn, nome_conta)
+                if not acc_id:
+                    return f"❌ Conta '{nome_conta}' não encontrada."
+                prog_id = self._get_program_id(conn, nome_programa)
+                if not prog_id:
+                    return f"❌ Programa '{nome_programa}' não encontrado."
+
+                total_milhas, total_custo, _, _ = self._get_cpm_totals(conn, acc_id, prog_id)
+
+            if total_milhas <= 0:
+                return f"❌ Nenhuma transação encontrada para {nome_programa} / {acc_nome}."
+
+            cpm_atual = round(total_custo / total_milhas * 1000, 2)
+
+            if abs(cpm_atual - cpm_alvo) < 0.01:
+                return (
+                    f"✅ O CPM atual de {nome_programa} / {acc_nome} já é **R$ {cpm_atual:.2f}** "
+                    "— nenhum ajuste necessário."
+                )
+
+            # Opção A: ajuste de custo (milhas não mudam)
+            delta_custo = round(cpm_alvo * total_milhas / 1000 - total_custo, 2)
+
+            linhas = [
+                f"🎯 Para atingir CPM de **R$ {cpm_alvo:.2f}** (atual: R$ {cpm_atual:.2f}) "
+                f"— {nome_programa} / {acc_nome}:\n",
+                f"Opção A — Ajuste de custo:",
+                f"  {'Reduzir' if delta_custo < 0 else 'Adicionar'} R$ {abs(delta_custo):.2f} no custo registrado",
+                f"  (sem alterar milhas)\n",
+            ]
+
+            # Opção B: adicionar milhas (só faz sentido se cpm_alvo < cpm_atual)
+            if cpm_alvo < cpm_atual:
+                delta_milhas = round(total_custo / cpm_alvo * 1000 - total_milhas)
+                linhas += [
+                    f"Opção B — Crédito de milhas grátis:",
+                    f"  Adicionar {delta_milhas:,} milhas sem custo",
+                    f"  (dilui o custo existente)\n",
+                ]
+            else:
+                linhas.append("Opção B — indisponível (CPM-alvo acima do atual; não é possível diluir com milhas grátis)\n")
+
+            linhas.append("Qual prefere? (A ou B)")
+            return "\n".join(linhas)
+
+        except Exception as e:
+            return _sanitize_error("calculate_cpm_adjustment", e)
+
+    @log_tool_call
+    def apply_cpm_adjustment(
+        self,
+        nome_conta: str,
+        nome_programa: str,
+        tipo_ajuste: str,
+        valor: float,
+        observacao: Optional[str] = None,
+    ) -> str:
+        """
+        Cria uma transação de ajuste de CPM (AJUSTE_CPM) e registra um checkpoint
+        automático. Use somente após confirmação explícita do usuário.
+
+        tipo_ajuste: 'CUSTO' (altera custo sem mudar milhas) ou
+                     'MILHAS' (adiciona milhas sem custo).
+        valor: delta a aplicar. Para CUSTO: positivo ou negativo.
+               Para MILHAS: apenas positivo (inteiro).
+        """
+        try:
+            tipo_ajuste = tipo_ajuste.upper().strip()
+            if tipo_ajuste not in ("CUSTO", "MILHAS"):
+                return "❌ tipo_ajuste deve ser 'CUSTO' ou 'MILHAS'."
+            if valor == 0:
+                return "❌ valor não pode ser zero."
+            if tipo_ajuste == "MILHAS" and (valor < 0 or not float(valor).is_integer()):
+                return "❌ Para tipo_ajuste='MILHAS', valor deve ser inteiro positivo."
+
+            with self._get_conn() as conn:
+                acc_id, acc_nome = self._get_account_id(conn, nome_conta)
+                if not acc_id:
+                    return f"❌ Conta '{nome_conta}' não encontrada."
+                prog_id = self._get_program_id(conn, nome_programa)
+                if not prog_id:
+                    return f"❌ Programa '{nome_programa}' não encontrado."
+
+                if tipo_ajuste == "CUSTO":
+                    _, total_custo_pre, _, _ = self._get_cpm_totals(conn, acc_id, prog_id)
+                    custo_resultante = total_custo_pre + float(valor)
+                    if custo_resultante < 0:
+                        return (
+                            f"❌ Ajuste inválido: o valor informado tornaria o custo total negativo "
+                            f"(resultado seria R$ {custo_resultante:,.2f}). "
+                            f"Consulte primeiro o cálculo de ajuste para obter o valor correto."
+                        )
+                    milhas_base = milhas_credit = 0
+                    custo = float(valor)
+                    descricao_tx = f"Ajuste de CPM: correção de custo ({valor:+.2f})"
+                else:
+                    milhas_base = milhas_credit = int(valor)
+                    custo = 0.0
+                    descricao_tx = f"Ajuste de CPM: crédito de {int(valor):,} milhas sem custo"
+
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO transactions
+                        (account_id, data_registro, data_transacao, modo_aquisicao,
+                         origem_id, destino_id, companhia_referencia_id,
+                         milhas_base, bonus_percent, milhas_creditadas,
+                         custo_total, cpm_real, descricao, observacao)
+                        VALUES (%s, CURRENT_DATE, CURRENT_DATE, 'AJUSTE_CPM',
+                                NULL, %s, %s,
+                                %s, 0, %s,
+                                %s, 0, %s, %s)
+                    """, (
+                        acc_id, prog_id, prog_id,
+                        milhas_base, milhas_credit,
+                        custo, descricao_tx, observacao,
+                    ))
+
+                # Checkpoint AUTO na mesma transação de banco
+                total_milhas, total_custo, _, delta = self._get_cpm_totals(conn, acc_id, prog_id)
+                self._insert_cpm_checkpoint(
+                    conn, acc_id, prog_id, nome_programa,
+                    "AUTO", total_milhas, total_custo, delta,
+                    tipo_ajuste=tipo_ajuste, valor_ajuste=float(valor),
+                    observacao=observacao,
+                )
+                conn.commit()
+
+            cpm_novo = round(total_custo / total_milhas * 1000, 2) if total_milhas > 0 else 0.0
+            if tipo_ajuste == "CUSTO":
+                detalhe = f"custo {'reduzido' if valor < 0 else 'adicionado'} em R$ {abs(valor):.2f}"
+            else:
+                detalhe = f"{int(valor):,} milhas creditadas sem custo"
+
+            return (
+                f"✅ Ajuste de CPM aplicado!\n"
+                f"📊 {nome_programa} / {acc_nome}: {detalhe}\n"
+                f"💡 **Novo CPM: R$ {cpm_novo:.2f}**\n"
+                f"📌 Checkpoint criado automaticamente."
+            )
+
+        except Exception as e:
+            return _sanitize_error("apply_cpm_adjustment", e)
+
+    @log_tool_call
+    def get_client_panorama(self, nome_conta: str) -> str:
+        """
+        Retorna uma visão geral de todos os programas do cliente com status de CPM
+        e saúde de checkpoint. Útil para identificar programas que precisam de atenção.
+        """
+        try:
+            hoje = date.today()
+            mes_anterior = f"{hoje.year}-{hoje.month - 1:02d}" if hoje.month > 1 else f"{hoje.year - 1}-12"
+
+            with self._get_conn() as conn:
+                acc_id, acc_nome = self._get_account_id(conn, nome_conta)
+                if not acc_id:
+                    return f"❌ Conta '{nome_conta}' não encontrada."
+
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT DISTINCT t.companhia_referencia_id, p.nome
+                        FROM transactions t
+                        JOIN programs p ON p.id = t.companhia_referencia_id
+                        WHERE t.account_id = %s
+                        ORDER BY p.nome
+                    """, (acc_id,))
+                    programas = cur.fetchall()
+
+                if not programas:
+                    return f"❌ Nenhuma transação encontrada para {acc_nome}."
+
+                linhas = []
+                total_geral = 0
+                alertas = []
+
+                for prog_id, prog_nome in programas:
+                    total_milhas, total_custo, checkpoint, delta = self._get_cpm_totals(
+                        conn, acc_id, prog_id
+                    )
+                    if total_milhas <= 0:
+                        continue
+
+                    cpm = round(total_custo / total_milhas * 1000, 2)
+                    delta_count = int(delta[0] or 0)
+
+                    # Verifica fechamento mensal do mês anterior
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            SELECT id FROM cpm_checkpoints
+                            WHERE account_id = %s AND programa_id = %s
+                              AND periodo_referencia = %s
+                        """, (acc_id, prog_id, mes_anterior))
+                        tem_mensal = cur.fetchone() is not None
+
+                    # Status de saúde
+                    if not checkpoint:
+                        status = "🔴 SEM CHECKPOINT"
+                        alertas.append(prog_nome)
+                    elif not tem_mensal or delta_count > 10:
+                        status = "⚠️ ALERTA"
+                        alertas.append(prog_nome)
+                    else:
+                        status = "✅ OK"
+
+                    # Fechamento mais recente
+                    if checkpoint and checkpoint["periodo_referencia"]:
+                        ano, mes = map(int, checkpoint["periodo_referencia"].split("-"))
+                        fech = f"{_MESES_PT[mes].capitalize()[:3]}/{ano}"
+                    elif checkpoint:
+                        fech = checkpoint["created_at"].strftime("%d/%m") + f" ({checkpoint['tipo']})"
+                    else:
+                        fech = "—"
+
+                    total_geral += total_milhas
+                    linhas.append(
+                        f"{prog_nome:<12} {total_milhas:>9,} mi   R$ {cpm:>6.2f}   "
+                        f"{fech:<14} {delta_count:>4} tx   {status}"
+                    )
+
+            cabecalho = (
+                f"📊 Panorama — {acc_nome}\n"
+                f"{'─' * 72}\n"
+                f"{'Programa':<12} {'Milhas':>12}   {'CPM':>9}   {'Fechamento':<14} {'s/chk':>5}   Status\n"
+                f"{'─' * 72}"
+            )
+            rodape = (
+                f"{'─' * 72}\n"
+                f"Total: {total_geral:,} milhas em {len(linhas)} programa(s)"
+            )
+            if alertas:
+                rodape += f"\n⚠️ Atenção necessária: {', '.join(alertas)}"
+
+            return "\n".join([cabecalho] + linhas + [rodape])
+
+        except Exception as e:
+            return _sanitize_error("get_client_panorama", e)
