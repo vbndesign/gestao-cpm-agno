@@ -821,12 +821,16 @@ class DatabaseManager(Toolkit):
                 if not prog_id: return f"❌ Programa '{nome_programa}' não encontrado."
 
                 with conn.cursor() as cur:
-                    # 1. Busca os dados do CONTRATO
+                    # 1. Busca os dados do CONTRATO com lock exclusivo para evitar race condition.
+                    # FOR UPDATE bloqueia a linha da assinatura até o commit, garantindo que
+                    # execuções concorrentes para a mesma assinatura aguardem e nunca passem
+                    # pela validação de saldo com dados desatualizados.
                     cur.execute("""
-                        SELECT id, cpm_fixo, milhas_garantidas_ciclo, valor_total_ciclo 
+                        SELECT id, cpm_fixo, milhas_garantidas_ciclo, valor_total_ciclo
                         FROM subscriptions
                         WHERE account_id = %s AND programa_id = %s AND ativo = TRUE
                         LIMIT 1
+                        FOR UPDATE
                     """, (acc_id, prog_id))
                     
                     sub = cur.fetchone()
