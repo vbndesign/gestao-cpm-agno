@@ -789,6 +789,29 @@ class DatabaseManager(Toolkit):
                         "Deletá-la altera o progresso do contrato.*"
                     ) if sub_id else ""
 
+                    # Verifica se existe checkpoint criado após esta transação
+                    # (significaria que a transação está na base do snapshot e corromperia o checkpoint)
+                    cur.execute("""
+                        SELECT tipo, cpm_snapshot, periodo_referencia
+                        FROM cpm_checkpoints
+                        WHERE account_id = %s
+                          AND programa_id = (SELECT companhia_referencia_id FROM transactions WHERE id = %s)
+                          AND created_at > (SELECT created_at FROM transactions WHERE id = %s)
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                    """, (acc_id, tx_id, tx_id))
+                    chk = cur.fetchone()
+                    if chk:
+                        chk_tipo, chk_cpm, chk_ref = chk
+                        ref_txt = f" ({chk_ref})" if chk_ref else f" ({chk_tipo})"
+                        aviso_checkpoint = (
+                            f"\n🚨 *Esta transação está incluída em um checkpoint de CPM{ref_txt} "
+                            f"(CPM confirmado: R$ {float(chk_cpm):.2f}). "
+                            f"Deletá-la invalidará esse checkpoint, que será removido automaticamente.*"
+                        )
+                    else:
+                        aviso_checkpoint = ""
+
                     bonus_info = f" + {int(bonus_pct)}% bônus" if bonus_pct else ""
                     resumo = (
                         f"📋 **Última transação de {acc_nome}:**\n"
@@ -799,6 +822,7 @@ class DatabaseManager(Toolkit):
                         f"- Data     : {data_tx.strftime('%d/%m/%Y') if data_tx else 'N/A'}\n"
                         f"- Descrição: {descricao or '—'}"
                         f"{aviso_clube}"
+                        f"{aviso_checkpoint}"
                     )
 
                     return (
@@ -823,7 +847,8 @@ class DatabaseManager(Toolkit):
             with self._get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute("""
-                        SELECT t.id, p.nome, t.milhas_creditadas, t.custo_total, t.data_transacao
+                        SELECT t.id, p.nome, t.milhas_creditadas, t.custo_total, t.data_transacao,
+                               t.account_id, t.companhia_referencia_id, t.created_at
                         FROM transactions t
                         JOIN programs p ON p.id = t.companhia_referencia_id
                         WHERE t.id = %s
@@ -832,14 +857,35 @@ class DatabaseManager(Toolkit):
                     if not row:
                         return "❌ Transação não encontrada. Verifique o ID ou execute o preview novamente."
 
-                    tx_id, prog_nome, milhas, custo, data_tx = row
+                    tx_id, prog_nome, milhas, custo, data_tx, acc_id, prog_id_ref, tx_created_at = row
+
+                    # Remove checkpoints que incluíam esta transação na sua base
+                    cur.execute("""
+                        DELETE FROM cpm_checkpoints
+                        WHERE account_id = %s AND programa_id = %s AND created_at > %s
+                        RETURNING tipo, periodo_referencia, cpm_snapshot
+                    """, (acc_id, prog_id_ref, tx_created_at))
+                    chks_removidos = cur.fetchall()
+
                     cur.execute("DELETE FROM transactions WHERE id = %s", (tx_id,), prepare=False)
                 conn.commit()
 
             data_fmt = data_tx.strftime('%d/%m/%Y') if data_tx else 'N/A'
+            aviso_chk = ""
+            if chks_removidos:
+                descricoes = []
+                for tipo, ref, snap in chks_removidos:
+                    ref_txt = f" ({ref})" if ref else f" ({tipo})"
+                    descricoes.append(f"CPM R$ {float(snap):.2f}{ref_txt}")
+                aviso_chk = (
+                    f"\n🗑️ Checkpoint(s) invalidado(s) e removido(s): {', '.join(descricoes)}.\n"
+                    f"   O histórico de CPM precisará ser reconfirmado."
+                )
+
             return (
                 f"🗑️ **Transação deletada com sucesso!**\n"
-                f"- Programa: {prog_nome} | {milhas:,} milhas | R$ {custo:.2f} | {data_fmt}\n\n"
+                f"- Programa: {prog_nome} | {milhas:,} milhas | R$ {custo:.2f} | {data_fmt}"
+                f"{aviso_chk}\n\n"
                 f"✅ O registro foi removido. Você pode lançar novamente com os dados corretos."
             )
         except Exception as e:
