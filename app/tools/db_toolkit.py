@@ -613,10 +613,16 @@ class DatabaseManager(Toolkit):
                                 data_inicio: Optional[str] = None,
                                 is_mensal: bool = False) -> str:
         """
-        CORREÇÃO: Apaga a última assinatura registrada para esta conta e insere a nova com os dados corrigidos.
+        CORREÇÃO: Desativa a assinatura ativa mais recente do programa informado e cria uma nova
+        com os dados corrigidos. As transações vinculadas são re-linkadas ao novo contrato,
+        preservando o histórico e a trava de segurança de créditos mensais.
         Use ISSO quando o usuário disser 'Errei o valor', 'Corrige a data', etc.
-        
+
+        IMPORTANTE: nome_programa é obrigatório — confirme com o usuário qual clube
+        precisa ser corrigido antes de chamar esta ferramenta.
+
         Args:
+            nome_programa: Nome do programa/clube a corrigir. SEMPRE confirmar com o usuário.
             valor_total_ciclo: Valor monetário do ciclo (mensal ou anual, dependendo de is_mensal).
             milhas_garantidas_ciclo: Quantidade de milhas do ciclo (mensal ou anual).
             data_renovacao: Data de renovação FUTURA. Aceita linguagem natural.
