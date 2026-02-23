@@ -65,6 +65,7 @@ class DatabaseManager(Toolkit):
         self.register(self.register_subscription)
         self.register(self.correct_last_subscription)
         self.register(self.delete_last_transaction)
+        self.register(self.confirm_delete_transaction)
         self.register(self.process_monthly_credit)
         self.register(self.register_intra_club_transaction)
 
@@ -706,24 +707,21 @@ class DatabaseManager(Toolkit):
     @log_tool_call
     def delete_last_transaction(self,
                                nome_conta: str,
-                               nome_programa: Optional[str] = None,
-                               confirmar: bool = False) -> str:
+                               nome_programa: Optional[str] = None) -> str:
         """
-        Desfaz (deleta) a ÚLTIMA transação registrada para uma conta.
+        Etapa 1/2: Exibe a última transação da conta para revisão antes de deletar.
 
         ⚠️ REGRA DE SEGURANÇA: Só é seguro apagar a ÚLTIMA transação.
         Transações anteriores já influenciaram o CPM das seguintes.
 
-        Fluxo obrigatório em 2 etapas:
-          1. Chame com confirmar=False → mostra o que seria apagado (preview).
-          2. Confirme com o usuário na conversa.
-          3. Só então chame com confirmar=True → executa a deleção.
+        Retorna um resumo da transação com o transaction_id necessário para
+        confirmar a deleção via confirm_delete_transaction(transaction_id=...).
+        Mostre o resumo ao usuário e aguarde confirmação explícita antes de prosseguir.
 
         Args:
             nome_conta:    Nome, CPF ou UUID da conta.
             nome_programa: Filtro opcional por programa. Use quando a conta tem
                            múltiplas transações recentes e precisa de precisão.
-            confirmar:     False = preview | True = deleta de verdade.
         """
         try:
             with self._get_conn() as conn:
@@ -786,25 +784,49 @@ class DatabaseManager(Toolkit):
                         f"{aviso_clube}"
                     )
 
-                    if not confirmar:
-                        return (
-                            f"{resumo}\n\n"
-                            f"❓ Confirma a exclusão? Se sim, chame novamente com `confirmar=True`."
-                        )
-
-                    # ── Deleção efetiva ──────────────────────────────────────
-                    # transaction_batches são removidos automaticamente (ON DELETE CASCADE)
-                    cur.execute("DELETE FROM transactions WHERE id = %s", (tx_id,), prepare=False)
-                    conn.commit()
-
                     return (
-                        f"🗑️ **Transação deletada com sucesso!**\n"
                         f"{resumo}\n\n"
-                        f"✅ O registro foi removido. Você pode lançar novamente com os dados corretos."
+                        f"❓ Confirma a exclusão? Se sim, chame `confirm_delete_transaction`"
+                        f" com `transaction_id='{tx_id}'`."
                     )
 
         except Exception as e:
             return _sanitize_error("delete_last_transaction", e)
+
+    @log_tool_call
+    def confirm_delete_transaction(self, transaction_id: str) -> str:
+        """
+        Etapa 2/2: Executa a deleção de uma transação previamente exibida em preview.
+        Requer o transaction_id retornado por delete_last_transaction().
+
+        ⚠️ Só chame após mostrar o preview ao usuário e obter confirmação explícita.
+        transaction_batches vinculados são removidos automaticamente (ON DELETE CASCADE).
+        """
+        try:
+            with self._get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT t.id, p.nome, t.milhas_creditadas, t.custo_total, t.data_transacao
+                        FROM transactions t
+                        JOIN programs p ON p.id = t.companhia_referencia_id
+                        WHERE t.id = %s
+                    """, (transaction_id,))
+                    row = cur.fetchone()
+                    if not row:
+                        return "❌ Transação não encontrada. Verifique o ID ou execute o preview novamente."
+
+                    tx_id, prog_nome, milhas, custo, data_tx = row
+                    cur.execute("DELETE FROM transactions WHERE id = %s", (tx_id,), prepare=False)
+                conn.commit()
+
+            data_fmt = data_tx.strftime('%d/%m/%Y') if data_tx else 'N/A'
+            return (
+                f"🗑️ **Transação deletada com sucesso!**\n"
+                f"- Programa: {prog_nome} | {milhas:,} milhas | R$ {custo:.2f} | {data_fmt}\n\n"
+                f"✅ O registro foi removido. Você pode lançar novamente com os dados corretos."
+            )
+        except Exception as e:
+            return _sanitize_error("confirm_delete_transaction", e)
 
     @log_tool_call
     def process_monthly_credit(self, nome_conta: str, nome_programa: str, milhas_do_mes: int = 0) -> str:
