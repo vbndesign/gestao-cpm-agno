@@ -201,6 +201,7 @@ CREATE INDEX IF NOT EXISTS idx_cpf_slots_programa_id ON cpf_slots(programa_id);
 CREATE INDEX IF NOT EXISTS idx_subs_account          ON subscriptions(account_id);
 CREATE INDEX IF NOT EXISTS idx_subs_programa         ON subscriptions(programa_id);
 CREATE INDEX IF NOT EXISTS idx_subs_renovacao        ON subscriptions(data_renovacao);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_subs_unique_active ON subscriptions (account_id, programa_id) WHERE ativo = TRUE;
 
 -- transactions
 CREATE INDEX IF NOT EXISTS idx_transactions_account_id             ON transactions(account_id);

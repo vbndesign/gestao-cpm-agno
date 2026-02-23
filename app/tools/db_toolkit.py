@@ -829,6 +829,7 @@ class DatabaseManager(Toolkit):
                         SELECT id, cpm_fixo, milhas_garantidas_ciclo, valor_total_ciclo
                         FROM subscriptions
                         WHERE account_id = %s AND programa_id = %s AND ativo = TRUE
+                        ORDER BY created_at DESC
                         LIMIT 1
                         FOR UPDATE
                     """, (acc_id, prog_id))
@@ -955,6 +956,7 @@ class DatabaseManager(Toolkit):
                     cur.execute("""
                         SELECT id FROM subscriptions
                         WHERE account_id = %s AND programa_id = %s AND ativo = TRUE
+                        ORDER BY created_at DESC
                         LIMIT 1
                     """, (acc_id, prog_id))
                     
