@@ -128,6 +128,28 @@ CREATE TABLE IF NOT EXISTS transaction_batches (
     ordem          INTEGER        DEFAULT 1
 );
 
+-- 6. cpm_checkpoints
+-- Fotografias do estado de CPM por conta/programa.
+-- Base do protocolo de reajuste: reconciliações partem do último checkpoint,
+-- processando apenas o delta de transações novas (eficiência de tokens/queries).
+CREATE TABLE IF NOT EXISTS cpm_checkpoints (
+    id                    UUID           PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id            UUID           NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    programa_id           UUID           NOT NULL REFERENCES programs(id),
+    data_checkpoint       DATE           NOT NULL DEFAULT CURRENT_DATE,
+    total_milhas          INTEGER        NOT NULL,
+    total_custo           NUMERIC(15,2)  NOT NULL,
+    cpm_snapshot          NUMERIC(15,2)  NOT NULL,
+    tipo                  TEXT           NOT NULL DEFAULT 'MANUAL'
+                              CHECK (tipo IN ('MENSAL', 'MANUAL', 'AUTO')),
+    periodo_referencia    TEXT,           -- formato 'YYYY-MM'; apenas em tipo='MENSAL'
+    delta_data_inicio     DATE,           -- data_transacao mais antiga do delta coberto
+    delta_data_fim        DATE,           -- data_transacao mais recente do delta coberto
+    descricao             TEXT,           -- descrição automática gerada pelo sistema
+    observacao            TEXT,           -- observação opcional fornecida pelo usuário
+    created_at            TIMESTAMPTZ    DEFAULT (NOW() AT TIME ZONE 'America/Sao_Paulo')
+);
+
 -- --------------------------------------------------------
 -- RASTREAMENTO DE MIGRATIONS
 -- --------------------------------------------------------
@@ -178,6 +200,13 @@ CREATE INDEX IF NOT EXISTS idx_transactions_subscription_id        ON transactio
 -- transaction_batches
 CREATE INDEX IF NOT EXISTS idx_transaction_batches_transaction_id ON transaction_batches(transaction_id);
 
+-- cpm_checkpoints
+CREATE INDEX IF NOT EXISTS idx_cpm_checkpoints_account_programa
+    ON cpm_checkpoints(account_id, programa_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cpm_checkpoints_mensal_unico
+    ON cpm_checkpoints(account_id, programa_id, periodo_referencia)
+    WHERE periodo_referencia IS NOT NULL;
+
 -- --------------------------------------------------------
 -- RLS (Row Level Security)
 -- --------------------------------------------------------
@@ -187,6 +216,7 @@ ALTER TABLE programs            ENABLE ROW LEVEL SECURITY;
 ALTER TABLE subscriptions       ENABLE ROW LEVEL SECURITY;
 ALTER TABLE transactions        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE transaction_batches ENABLE ROW LEVEL SECURITY;
+ALTER TABLE cpm_checkpoints     ENABLE ROW LEVEL SECURITY;
 
 -- --------------------------------------------------------
 -- COMENTÁRIOS
@@ -203,3 +233,11 @@ COMMENT ON COLUMN subscriptions.cpm_fixo               IS 'Coluna CALCULADA (ger
 COMMENT ON COLUMN subscriptions.valor_total_ciclo      IS 'Custo total pago no ciclo.';
 COMMENT ON COLUMN subscriptions.milhas_garantidas_ciclo IS 'Total de milhas garantidas no ciclo.';
 COMMENT ON COLUMN subscriptions.data_renovacao         IS 'Data da próxima renovação ou débito.';
+
+COMMENT ON TABLE  cpm_checkpoints                    IS 'Fotografias do estado de CPM por conta/programa. Base do protocolo de reajuste de CPM.';
+COMMENT ON COLUMN cpm_checkpoints.tipo               IS 'MENSAL=fechamento de mês, MANUAL=confirmação manual, AUTO=criado automaticamente pós-ajuste';
+COMMENT ON COLUMN cpm_checkpoints.periodo_referencia IS 'Formato YYYY-MM. Preenchido apenas em tipo=MENSAL. Índice único garante 1 fechamento por mês.';
+COMMENT ON COLUMN cpm_checkpoints.delta_data_inicio  IS 'data_transacao mais antiga das transações cobertas por este checkpoint';
+COMMENT ON COLUMN cpm_checkpoints.delta_data_fim     IS 'data_transacao mais recente das transações cobertas por este checkpoint';
+COMMENT ON COLUMN cpm_checkpoints.descricao          IS 'Descrição automática gerada pelo sistema';
+COMMENT ON COLUMN cpm_checkpoints.observacao         IS 'Observação opcional fornecida pelo usuário';
